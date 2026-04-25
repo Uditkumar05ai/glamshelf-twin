@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Glam Shelf Twin — Phase 0</title>
+  <style>
+    body {
+      font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
+      max-width: 720px;
+      margin: 40px auto;
+      padding: 0 20px;
+      color: #222;
+      background: #fafafa;
+    }
+    h1 { font-size: 26px; margin-bottom: 4px; }
+    .subtitle { color: #888; margin-bottom: 28px; font-size: 14px; }
+    label {
+      display: block;
+      font-weight: 600;
+      margin-top: 18px;
+      margin-bottom: 6px;
+      font-size: 14px;
+    }
+    textarea {
+      width: 100%;
+      padding: 10px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-family: inherit;
+      font-size: 14px;
+      box-sizing: border-box;
+      resize: vertical;
+    }
+    .button-row {
+      margin-top: 14px;
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    button {
+      padding: 9px 18px;
+      background: #c2185b;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      font-family: inherit;
+      cursor: pointer;
+    }
+    button:hover:not(:disabled) { background: #a01548; }
+    button:disabled { background: #c891a8; cursor: not-allowed; }
+    button.secondary { background: #4a4a4a; }
+    button.secondary:hover:not(:disabled) { background: #2d2d2d; }
+    button.ghost { background: transparent; color: #666; border: 1px solid #ccc; }
+    button.ghost:hover:not(:disabled) { background: #eee; color: #222; }
+
+    /* Placeholder (shown before first draft or after clear) */
+    .placeholder-panel {
+      margin-top: 28px;
+      padding: 20px;
+      background: #fff;
+      border: 1px dashed #ddd;
+      border-radius: 6px;
+      color: #999;
+      font-size: 14px;
+      text-align: center;
+    }
+    .placeholder-panel.loading { color: #666; border-style: solid; border-color: #e3e3e3; }
+    .placeholder-panel.error {
+      color: #b71c1c;
+      background: #fff5f5;
+      border-color: #f5c2c2;
+      border-style: solid;
+      text-align: left;
+      font-family: ui-monospace, "Consolas", monospace;
+      font-size: 13px;
+      white-space: pre-wrap;
+    }
+
+    /* Results panel (shown after successful draft) */
+    .results-panel { margin-top: 28px; display: none; }
+    .results-panel.visible { display: block; }
+
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .badge {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.4px;
+      text-transform: uppercase;
+    }
+    .badge.auto { background: #d4edda; color: #155724; border: 1px solid #b5dbc0; }
+    .badge.draft { background: #fff3cd; color: #856404; border: 1px solid #ffe69c; }
+    .badge.escalate { background: #f8d7da; color: #721c24; border: 1px solid #f1b0b7; }
+    .badge.unknown { background: #e2e3e5; color: #383d41; border: 1px solid #d6d8db; }
+    .elapsed { color: #999; font-size: 12px; }
+
+    .reply-box {
+      padding: 16px;
+      background: #fff;
+      border: 1px solid #e3e3e3;
+      border-radius: 6px;
+      color: #222;
+      white-space: pre-wrap;
+      font-family: ui-monospace, "Cascadia Mono", "Consolas", monospace;
+      font-size: 14px;
+      line-height: 1.55;
+    }
+
+    .status-message {
+      font-size: 13px;
+      color: #999;
+      margin-top: 8px;
+      min-height: 18px;
+    }
+    .status-message.success { color: #155724; font-weight: 600; }
+    .status-message.error { color: #b71c1c; }
+  </style>
+</head>
+<body>
+  <h1>Glam Shelf Twin</h1>
+  <div class="subtitle">Phase 0 — local reply drafter</div>
+
+  <form id="draft-form">
+    <label for="customer-message">Customer message *</label>
+    <textarea id="customer-message" rows="4"
+      placeholder="Paste the WhatsApp message from the customer..." required></textarea>
+
+    <label for="order-context">Order context (optional)</label>
+    <textarea id="order-context" rows="3"
+      placeholder="Paste Shopify order details if relevant..."></textarea>
+
+    <div class="button-row">
+      <button type="submit" id="submit-btn">Draft reply</button>
+      <button type="button" id="clear-btn" class="ghost">Clear</button>
+    </div>
+  </form>
+
+  <!-- Placeholder / loading / error panel -->
+  <div class="placeholder-panel" id="placeholder">
+    Drafted reply will appear here.
+  </div>
+
+  <!-- Results panel (hidden until first successful draft) -->
+  <div class="results-panel" id="results">
+    <div class="status-row">
+      <span class="badge" id="badge"></span>
+      <span class="elapsed" id="elapsed"></span>
+    </div>
+    <div class="reply-box" id="reply-box"></div>
+    <div class="button-row">
+      <button type="button" id="copy-btn">Copy to clipboard</button>
+      <button type="button" id="redraft-btn" class="secondary">Re-draft</button>
+    </div>
+    <div class="status-message" id="status-message"></div>
+  </div>
+
+  <script>
+    const form          = document.getElementById("draft-form");
+    const submitBtn     = document.getElementById("submit-btn");
+    const clearBtn      = document.getElementById("clear-btn");
+    const copyBtn       = document.getElementById("copy-btn");
+    const redraftBtn    = document.getElementById("redraft-btn");
+    const customerInput = document.getElementById("customer-message");
+    const orderInput    = document.getElementById("order-context");
+    const placeholderEl = document.getElementById("placeholder");
+    const resultsEl     = document.getElementById("results");
+    const badgeEl       = document.getElementById("badge");
+    const elapsedEl     = document.getElementById("elapsed");
+    const replyBox      = document.getElementById("reply-box");
+    const statusMsg     = document.getElementById("status-message");
+
+    // Holds the most recently drafted reply so Copy can read it without
+    // depending on DOM text (which may contain the actual reply).
+    let currentReply = "";
+
+    function setBusy(busy) {
+      submitBtn.disabled  = busy;
+      redraftBtn.disabled = busy;
+      clearBtn.disabled   = busy;
+      copyBtn.disabled    = busy || !currentReply;
+      submitBtn.textContent  = busy ? "Drafting..." : "Draft reply";
+      redraftBtn.textContent = busy ? "Drafting..." : "Re-draft";
+    }
+
+    function showPlaceholder(text, variant = "idle") {
+      resultsEl.classList.remove("visible");
+      placeholderEl.style.display = "block";
+      placeholderEl.textContent = text;
+      placeholderEl.className = "placeholder-panel";
+      if (variant !== "idle") placeholderEl.classList.add(variant);
+    }
+
+    function showResults(classification, reply, elapsedSec) {
+      placeholderEl.style.display = "none";
+      resultsEl.classList.add("visible");
+
+      badgeEl.textContent = classification;
+      badgeEl.className = "badge";
+      if (classification === "AUTO")                badgeEl.classList.add("auto");
+      else if (classification === "DRAFT+APPROVE")  badgeEl.classList.add("draft");
+      else if (classification === "ESCALATE")       badgeEl.classList.add("escalate");
+      else                                          badgeEl.classList.add("unknown");
+
+      elapsedEl.textContent = `drafted in ${elapsedSec}s`;
+      replyBox.textContent  = reply;      // textContent preserves emoji, no XSS risk
+      currentReply = reply;
+
+      statusMsg.textContent = "";
+      statusMsg.className = "status-message";
+    }
+
+    async function submitDraft() {
+      const customerMessage = customerInput.value.trim();
+      const orderContext    = orderInput.value.trim();
+
+      if (!customerMessage) {
+        customerInput.focus();
+        return;
+      }
+
+      setBusy(true);
+      showPlaceholder("Calling Claude... (usually 3-8 seconds)", "loading");
+
+      console.log("[UI] POST /draft");
+      const start = Date.now();
+
+      try {
+        const response = await fetch("/draft", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            customer_message: customerMessage,
+            order_context: orderContext,
+          }),
+        });
+
+        const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+        const data = await response.json();
+        console.log(`[UI] ${response.status} in ${elapsed}s`, data);
+
+        if (!response.ok) {
+          showPlaceholder(`Server error: ${data.error || "Unknown error"}`, "error");
+          return;
+        }
+
+        // Parse the raw JSON Claude returned.
+        let parsed;
+        try {
+          parsed = JSON.parse(data.raw);
+        } catch (parseErr) {
+          console.error("[UI] JSON parse error:", parseErr, "raw:", data.raw);
+          showPlaceholder(
+            `Claude returned invalid JSON. Raw response:\n\n${data.raw}`,
+            "error"
+          );
+          return;
+        }
+
+        const { classification, reply } = parsed;
+        if (!classification || !reply) {
+          showPlaceholder(
+            `Missing classification or reply in response:\n\n${data.raw}`,
+            "error"
+          );
+          return;
+        }
+
+        showResults(classification, reply, elapsed);
+      } catch (err) {
+        console.error("[UI] Fetch failed:", err);
+        showPlaceholder(`Network error: ${err.message}`, "error");
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      submitDraft();
+    });
+
+    redraftBtn.addEventListener("click", () => {
+      console.log("[UI] Re-draft requested");
+      submitDraft();
+    });
+
+    clearBtn.addEventListener("click", () => {
+      console.log("[UI] Clear");
+      customerInput.value = "";
+      orderInput.value    = "";
+      currentReply = "";
+      showPlaceholder("Drafted reply will appear here.");
+      customerInput.focus();
+    });
+
+    copyBtn.addEventListener("click", async () => {
+      if (!currentReply) return;
+      try {
+        await navigator.clipboard.writeText(currentReply);
+        console.log("[UI] Copied to clipboard");
+        statusMsg.textContent = "Copied!";
+        statusMsg.className = "status-message success";
+        setTimeout(() => {
+          statusMsg.textContent = "";
+          statusMsg.className = "status-message";
+        }, 2000);
+      } catch (err) {
+        console.error("[UI] Clipboard write failed:", err);
+        statusMsg.textContent = `Copy failed: ${err.message}`;
+        statusMsg.className = "status-message error";
+      }
+    });
+  </script>
+</body>
+</html>
