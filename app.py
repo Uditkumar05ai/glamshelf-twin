@@ -11,12 +11,14 @@ Auth: ANTHROPIC_API_KEY environment variable.
   - Render: set it in the service's Environment dashboard
 """
 
+import json
 import os
 import sys
 import traceback
 from functools import wraps
 from pathlib import Path
 
+import requests
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from flask import (
@@ -56,8 +58,76 @@ BRAIN_FILE = PROJECT_DIR / "brain" / "brain.md"
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 2048
 
+# Telegram notification config. Override on Render via env vars.
+# SECURITY NOTE: The defaults below are committed to source — fine for a
+# private internal tool but rotate the bot token if the repo ever goes public.
+TELEGRAM_BOT_TOKEN = os.environ.get(
+    "TELEGRAM_BOT_TOKEN", "***REVOKED-TELEGRAM-TOKEN***"
+)
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6733243879")
+TELEGRAM_TIMEOUT_SECONDS = 5
+
 # Anthropic client picks up ANTHROPIC_API_KEY from the environment.
 client = Anthropic()
+
+
+def send_telegram_notification(classification: str, customer_message: str, reply: str) -> None:
+    """Fire a Telegram message to the founder for DRAFT+APPROVE and ESCALATE.
+
+    AUTO classifications send nothing (the reply was safe to send as-is and
+    Udit doesn't need to be paged about it).
+
+    All failures (network, Telegram API errors, missing token, etc.) are
+    logged and swallowed — Telegram is a side effect, never a blocker for
+    the /api/draft response.
+    """
+    if classification == "AUTO":
+        return  # No notification needed for safe replies.
+
+    if classification == "DRAFT+APPROVE":
+        text = (
+            "🟡 DRAFT + APPROVE\n\n"
+            "Customer said:\n"
+            f'"{customer_message}"\n\n'
+            "Drafted reply:\n"
+            f'"{reply}"\n\n'
+            "→ Review and send manually from your WhatsApp Business app."
+        )
+    elif classification == "ESCALATE":
+        text = (
+            "🔴 ESCALATE — Take over directly\n\n"
+            "Customer said:\n"
+            f'"{customer_message}"\n\n'
+            "Suggested holding reply:\n"
+            f'"{reply}"\n\n'
+            "→ Do NOT send the reply. Handle this yourself."
+        )
+    else:
+        # Unknown / malformed classification — don't spam Telegram.
+        print(f"[TG] Skipped: unknown classification {classification!r}")
+        return
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[TG] Skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+
+    try:
+        response = requests.post(url, json=payload, timeout=TELEGRAM_TIMEOUT_SECONDS)
+        if response.ok:
+            print(f"[TG] Sent {classification} notification ({len(text)} chars)")
+        else:
+            print(
+                f"[TG] Telegram returned {response.status_code}: "
+                f"{response.text[:300]}"
+            )
+    except requests.RequestException as e:
+        print(f"[TG] Network error: {type(e).__name__}: {e}")
+    except Exception as e:
+        # Defensive — never let a Telegram bug break the API call.
+        print(f"[TG] Unexpected error: {type(e).__name__}: {e}")
 
 
 def login_required(view):
@@ -241,6 +311,22 @@ def draft():
     try:
         brain = load_brain()
         raw_response = ask_claude(brain, customer_message, order_context)
+
+        # Side effect: page the founder on Telegram for non-AUTO classifications.
+        # Wrapped in try/except so Telegram issues never break the API response.
+        try:
+            parsed = json.loads(raw_response)
+            classification = (parsed.get("classification") or "").strip()
+            reply = (parsed.get("reply") or "").strip()
+            if classification and reply:
+                send_telegram_notification(classification, customer_message, reply)
+            else:
+                print("[TG] Skipped: parsed JSON missing classification or reply")
+        except json.JSONDecodeError:
+            print("[TG] Skipped: Claude's response wasn't valid JSON")
+        except Exception as e:
+            print(f"[TG] Wrapper error: {type(e).__name__}: {e}")
+
         print(f"[DRAFT] Returning raw response ({len(raw_response)} chars)")
         print("=" * 60 + "\n")
         return jsonify({"raw": raw_response})
