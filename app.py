@@ -73,6 +73,11 @@ WATI_API_KEY = os.environ.get("WATI_API_KEY", "")
 WATI_ENDPOINT = os.environ.get("WATI_ENDPOINT", "")
 WATI_TIMEOUT_SECONDS = 10
 
+# The Glam Shelf's WhatsApp Business number. The webhook ignores any inbound
+# event where waId equals this number — prevents the twin from replying to
+# itself if WATI ever loops outbound / own messages through the webhook.
+BUSINESS_NUMBER = os.environ.get("BUSINESS_NUMBER", "919217470151")
+
 # Anthropic client picks up ANTHROPIC_API_KEY from the environment.
 client = Anthropic()
 
@@ -467,6 +472,12 @@ def webhook():
 
         if not wa_id:
             print("[WEBHOOK] Skipped: missing waId")
+            return jsonify({"status": "ok"}), 200
+
+        # Don't process messages from our own business number — prevents
+        # the twin from replying to itself if WATI loops outbound events.
+        if wa_id == BUSINESS_NUMBER:
+            print(f"[WEBHOOK] Skipped: message from business number {wa_id}")
             return jsonify({"status": "ok"}), 200
 
         print(f"[WEBHOOK] Processing text from {sender_name or wa_id}: {text_body[:200]}")
