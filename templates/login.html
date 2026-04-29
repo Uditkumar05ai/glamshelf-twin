@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign In · The Glam Shelf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0b0a08;
+      --surface: #131110;
+      --surface-2: #1a1815;
+      --gold: #c9a84c;
+      --gold-soft: rgba(201, 168, 76, 0.12);
+      --gold-ring: rgba(201, 168, 76, 0.35);
+      --text: #e6e1d8;
+      --muted: #7a7570;
+      --error: #e26970;
+      --error-bg: rgba(226, 105, 112, 0.08);
+      --error-border: rgba(226, 105, 112, 0.35);
+      --serif: "Cormorant Garamond", Georgia, serif;
+      --sans: "DM Sans", -apple-system, system-ui, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body { height: 100%; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 15px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 24px;
+    }
+
+    .card {
+      width: 100%;
+      max-width: 400px;
+      background: var(--surface);
+      border: 1px solid rgba(255, 255, 255, 0.04);
+      border-radius: 16px;
+      padding: 40px 32px 32px;
+      box-shadow: 0 24px 48px rgba(0, 0, 0, 0.45);
+    }
+
+    .logo-mark {
+      width: 64px;
+      height: 64px;
+      border-radius: 50%;
+      border: 1.5px solid var(--gold);
+      background: var(--gold-soft);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 20px;
+    }
+
+    .logo-mark svg { display: block; }
+
+    h1.brand {
+      font-family: var(--serif);
+      font-weight: 500;
+      font-size: 28px;
+      letter-spacing: 0.5px;
+      margin: 0;
+      text-align: center;
+      color: var(--text);
+    }
+
+    .subtitle {
+      text-align: center;
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      margin: 8px 0 32px;
+    }
+
+    label {
+      display: block;
+      font-size: 12px;
+      letter-spacing: 1.2px;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .pw-wrap {
+      position: relative;
+    }
+
+    input[type="password"], input[type="text"] {
+      width: 100%;
+      padding: 12px 44px 12px 14px;
+      background: var(--surface-2);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 8px;
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 15px;
+      transition: border-color 0.18s ease, box-shadow 0.18s ease;
+    }
+
+    input[type="password"]:focus, input[type="text"]:focus {
+      outline: none;
+      border-color: var(--gold);
+      box-shadow: 0 0 0 3px var(--gold-ring);
+    }
+
+    .toggle-pw {
+      position: absolute;
+      right: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      cursor: pointer;
+      padding: 6px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: color 0.15s ease;
+    }
+
+    .toggle-pw:hover { color: var(--gold); }
+
+    button.submit {
+      width: 100%;
+      margin-top: 20px;
+      padding: 12px;
+      background: var(--gold);
+      color: #1a1612;
+      border: none;
+      border-radius: 8px;
+      font-family: var(--sans);
+      font-weight: 600;
+      font-size: 14px;
+      letter-spacing: 0.6px;
+      cursor: pointer;
+      transition: background 0.15s ease, transform 0.05s ease;
+    }
+
+    button.submit:hover { background: #d4b85d; }
+    button.submit:active { transform: translateY(1px); }
+
+    .error {
+      margin-top: 16px;
+      padding: 10px 12px;
+      background: var(--error-bg);
+      border: 1px solid var(--error-border);
+      border-radius: 6px;
+      color: var(--error);
+      font-size: 13px;
+    }
+
+    footer {
+      margin-top: 28px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0.4px;
+    }
+    footer a { color: inherit; text-decoration: none; border-bottom: 1px dotted var(--muted); }
+    footer a:hover { color: var(--gold); border-color: var(--gold); }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo-mark" aria-hidden="true">
+      <!-- Stylised eye / lash mark -->
+      <svg viewBox="0 0 40 40" width="36" height="36" fill="none" stroke="#c9a84c" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M6 22 Q 20 8, 34 22"/>
+        <path d="M8 22 Q 20 30, 32 22"/>
+        <circle cx="20" cy="22" r="2.4" fill="#c9a84c" stroke="none"/>
+      </svg>
+    </div>
+
+    <h1 class="brand">The Glam Shelf</h1>
+    <div class="subtitle">Support Twin · Internal Tool</div>
+
+    <form method="POST" action="{{ url_for('login') }}" autocomplete="off">
+      <label for="password">Access Password</label>
+      <div class="pw-wrap">
+        <input type="password" id="password" name="password" required autofocus>
+        <button type="button" class="toggle-pw" id="toggle-pw" aria-label="Show password">
+          <svg id="eye-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/>
+            <circle cx="12" cy="12" r="3"/>
+          </svg>
+        </button>
+      </div>
+
+      <button type="submit" class="submit">Sign In</button>
+
+      {% if error %}
+        <div class="error" role="alert">{{ error }}</div>
+      {% endif %}
+    </form>
+  </div>
+
+  <footer>
+    <a href="https://glamshelf.in" target="_blank" rel="noopener">glamshelf.in</a>
+    &nbsp;·&nbsp;
+    For founder use only
+  </footer>
+
+  <script>
+    const togglePw = document.getElementById("toggle-pw");
+    const pwInput  = document.getElementById("password");
+    const eyeIcon  = document.getElementById("eye-icon");
+
+    const eyeOpen  = '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/>';
+    const eyeClosed = '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/><line x1="3" y1="3" x2="21" y2="21" stroke="currentColor"/>';
+
+    togglePw.addEventListener("click", () => {
+      const isHidden = pwInput.type === "password";
+      pwInput.type = isHidden ? "text" : "password";
+      eyeIcon.innerHTML = isHidden ? eyeClosed : eyeOpen;
+      togglePw.setAttribute("aria-label", isHidden ? "Hide password" : "Show password");
+    });
+  </script>
+</body>
+</html>

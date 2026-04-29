@@ -14,11 +14,20 @@ Auth: ANTHROPIC_API_KEY environment variable.
 import os
 import sys
 import traceback
+from functools import wraps
 from pathlib import Path
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template, request
+from flask import (
+    Flask,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 
 # Load .env for local dev. On Render, env vars come from the dashboard
 # and python-dotenv silently no-ops if .env is missing.
@@ -36,6 +45,12 @@ for _stream in (sys.stdout, sys.stderr):
 
 app = Flask(__name__)
 
+# Session secret for cookie signing. Override SECRET_KEY in Render's env vars.
+app.secret_key = os.environ.get("SECRET_KEY", "gs-twin-secret-xk92")
+
+# Single-user password gate. Override APP_PASSWORD in Render's env vars.
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "glamshelf2026")
+
 PROJECT_DIR = Path(__file__).parent.resolve()
 BRAIN_FILE = PROJECT_DIR / "brain" / "brain.md"
 MODEL = "claude-sonnet-4-6"
@@ -43,6 +58,24 @@ MAX_TOKENS = 2048
 
 # Anthropic client picks up ANTHROPIC_API_KEY from the environment.
 client = Anthropic()
+
+
+def login_required(view):
+    """Gate a view behind session auth.
+
+    Browser views (e.g. /) get a redirect to /login.
+    JSON endpoints under /api/ get a 401 JSON response so the frontend
+    can react gracefully instead of receiving an HTML redirect.
+    """
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not session.get("authed"):
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "unauthorized"}), 401
+            return redirect(url_for("login"))
+        return view(*args, **kwargs)
+
+    return wrapped
 
 
 def load_brain() -> str:
@@ -141,7 +174,30 @@ def ask_claude(brain: str, customer_message: str, order_context: str) -> str:
     return cleaned
 
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    if request.method == "POST":
+        password = (request.form.get("password") or "").strip()
+        if password == APP_PASSWORD:
+            session["authed"] = True
+            session.permanent = True
+            print("[AUTH] Login successful")
+            return redirect(url_for("home"))
+        print("[AUTH] Login failed (wrong password)")
+        error = "Incorrect password. Please try again."
+    return render_template("login.html", error=error)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    print("[AUTH] Logged out")
+    return redirect(url_for("login"))
+
+
 @app.route("/")
+@login_required
 def home():
     print("[INFO] Homepage requested")
     return render_template("index.html")
@@ -150,7 +206,8 @@ def home():
 @app.route("/healthz")
 def healthz():
     """Liveness probe. Render can ping this to confirm the deploy works.
-    Reports whether brain.md is present so a misconfigured deploy is obvious."""
+    Reports whether brain.md is present so a misconfigured deploy is obvious.
+    Intentionally NOT behind login_required — Render needs to hit it without auth."""
     return jsonify({
         "status": "ok",
         "brain_present": BRAIN_FILE.exists(),
@@ -160,7 +217,8 @@ def healthz():
     })
 
 
-@app.route("/draft", methods=["POST"])
+@app.route("/api/draft", methods=["POST"])
+@login_required
 def draft():
     print("\n" + "=" * 60)
     print("[DRAFT] New request received")
