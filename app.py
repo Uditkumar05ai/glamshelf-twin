@@ -67,26 +67,44 @@ TELEGRAM_BOT_TOKEN = os.environ.get(
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6733243879")
 TELEGRAM_TIMEOUT_SECONDS = 5
 
+# WATI (WhatsApp Business API) config. Set these in Render env vars.
+# WATI_ENDPOINT format: https://live-mt-server.wati.io/<account_id>
+WATI_API_KEY = os.environ.get("WATI_API_KEY", "")
+WATI_ENDPOINT = os.environ.get("WATI_ENDPOINT", "")
+WATI_TIMEOUT_SECONDS = 10
+
 # Anthropic client picks up ANTHROPIC_API_KEY from the environment.
 client = Anthropic()
 
 
-def send_telegram_notification(classification: str, customer_message: str, reply: str) -> None:
+def send_telegram_notification(
+    classification: str,
+    customer_message: str,
+    reply: str,
+    sender_info: str | None = None,
+) -> None:
     """Fire a Telegram message to the founder for DRAFT+APPROVE and ESCALATE.
 
     AUTO classifications send nothing (the reply was safe to send as-is and
     Udit doesn't need to be paged about it).
 
+    sender_info is optional — when present (e.g. when called from the WATI
+    webhook), it's prepended to the message so Udit knows which WhatsApp
+    contact to reply to.
+
     All failures (network, Telegram API errors, missing token, etc.) are
     logged and swallowed — Telegram is a side effect, never a blocker for
-    the /api/draft response.
+    the /api/draft response or the /webhook 200 reply.
     """
     if classification == "AUTO":
         return  # No notification needed for safe replies.
 
+    sender_block = f"From: {sender_info}\n\n" if sender_info else ""
+
     if classification == "DRAFT+APPROVE":
         text = (
             "🟡 DRAFT + APPROVE\n\n"
+            f"{sender_block}"
             "Customer said:\n"
             f'"{customer_message}"\n\n'
             "Drafted reply:\n"
@@ -96,6 +114,7 @@ def send_telegram_notification(classification: str, customer_message: str, reply
     elif classification == "ESCALATE":
         text = (
             "🔴 ESCALATE — Take over directly\n\n"
+            f"{sender_block}"
             "Customer said:\n"
             f'"{customer_message}"\n\n'
             "Suggested holding reply:\n"
@@ -128,6 +147,74 @@ def send_telegram_notification(classification: str, customer_message: str, reply
     except Exception as e:
         # Defensive — never let a Telegram bug break the API call.
         print(f"[TG] Unexpected error: {type(e).__name__}: {e}")
+
+
+def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
+    """Send an outbound WhatsApp message to a customer via WATI.
+
+    Used for AUTO-classified replies in the /webhook handler. All failures
+    are logged and swallowed — the webhook must always return 200 to WATI
+    or WATI will retry and we'll send duplicates.
+    """
+    if not WATI_API_KEY or not WATI_ENDPOINT:
+        print("[WATI] Skipped: WATI_API_KEY or WATI_ENDPOINT not set")
+        return
+
+    endpoint = WATI_ENDPOINT.rstrip("/")
+    url = f"{endpoint}/api/v1/sendSessionMessage/{wa_id}"
+    headers = {
+        "Authorization": f"Bearer {WATI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {"messageText": reply_text}
+
+    try:
+        response = requests.post(
+            url, headers=headers, json=payload, timeout=WATI_TIMEOUT_SECONDS
+        )
+        if response.ok:
+            print(f"[WATI] Sent reply to {wa_id} ({len(reply_text)} chars)")
+        else:
+            print(
+                f"[WATI] Returned {response.status_code}: "
+                f"{response.text[:300]}"
+            )
+    except requests.RequestException as e:
+        print(f"[WATI] Network error: {type(e).__name__}: {e}")
+    except Exception as e:
+        print(f"[WATI] Unexpected error: {type(e).__name__}: {e}")
+
+
+def draft_reply_logic(message: str, order_context: str = "") -> tuple[str, str, str]:
+    """Core twin pipeline — load brain, call Claude, parse classification.
+
+    Returns (classification, reply, raw_response).
+      - classification: "AUTO" | "DRAFT+APPROVE" | "ESCALATE", or "" if parse failed
+      - reply: drafted message text, or "" if parse failed
+      - raw_response: exactly what Claude returned (after fence stripping)
+
+    Used by both /api/draft (which returns raw_response to the browser)
+    and /webhook (which dispatches based on classification).
+
+    Raises if brain.md is missing or the Claude API call fails — callers
+    must catch and decide how to surface the error.
+    """
+    if not BRAIN_FILE.exists():
+        raise FileNotFoundError(f"brain file not found at {BRAIN_FILE}")
+
+    brain = load_brain()
+    raw = ask_claude(brain, message, order_context)
+
+    classification = ""
+    reply = ""
+    try:
+        parsed = json.loads(raw)
+        classification = (parsed.get("classification") or "").strip()
+        reply = (parsed.get("reply") or "").strip()
+    except json.JSONDecodeError:
+        print("[TWIN] Claude's response wasn't valid JSON — leaving classification/reply empty")
+
+    return classification, reply, raw
 
 
 def login_required(view):
@@ -309,21 +396,17 @@ def draft():
         return jsonify({"error": f"brain file not found at {BRAIN_FILE}"}), 500
 
     try:
-        brain = load_brain()
-        raw_response = ask_claude(brain, customer_message, order_context)
+        classification, reply, raw_response = draft_reply_logic(
+            customer_message, order_context
+        )
 
         # Side effect: page the founder on Telegram for non-AUTO classifications.
         # Wrapped in try/except so Telegram issues never break the API response.
         try:
-            parsed = json.loads(raw_response)
-            classification = (parsed.get("classification") or "").strip()
-            reply = (parsed.get("reply") or "").strip()
             if classification and reply:
                 send_telegram_notification(classification, customer_message, reply)
             else:
                 print("[TG] Skipped: parsed JSON missing classification or reply")
-        except json.JSONDecodeError:
-            print("[TG] Skipped: Claude's response wasn't valid JSON")
         except Exception as e:
             print(f"[TG] Wrapper error: {type(e).__name__}: {e}")
 
@@ -335,6 +418,100 @@ def draft():
         print("[DRAFT] Full traceback:")
         traceback.print_exc()
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+
+@app.route("/webhook", methods=["GET"])
+def webhook_verify():
+    """Some platforms (and WATI's URL test) send a GET to verify the
+    webhook endpoint is reachable. Just respond 200 OK."""
+    print("[WEBHOOK] GET verification ping")
+    return jsonify({"status": "ok"}), 200
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    """WATI calls this when a customer sends us an inbound WhatsApp message.
+
+    We ALWAYS return 200, even when nothing is processed or an internal
+    error occurs — WATI retries on non-2xx responses, which would cause
+    duplicate auto-replies and Telegram spam. The catch-all at the bottom
+    is the safety net.
+
+    Flow:
+      type != "text" or empty body  →  200, no work
+      AUTO classification           →  send_whatsapp_reply(wa_id, reply)
+      DRAFT+APPROVE / ESCALATE      →  send_telegram_notification(...) with sender_info
+    """
+    print("\n" + "=" * 60)
+    try:
+        data = request.get_json(silent=True) or {}
+        message_type = (data.get("type") or "").strip().lower()
+        wa_id = (data.get("waId") or "").strip()
+        sender_name = (data.get("senderName") or "").strip()
+        text_body = ((data.get("text") or {}).get("body") or "").strip()
+        msg_id = (data.get("id") or "").strip()
+
+        print(
+            f"[WEBHOOK] type={message_type!r} wa_id={wa_id!r} "
+            f"sender={sender_name!r} msg_id={msg_id!r}"
+        )
+
+        # Skip non-text events (images, audio, video, documents, stickers, status updates).
+        if message_type != "text":
+            print(f"[WEBHOOK] Skipped: non-text message type {message_type!r}")
+            return jsonify({"status": "ok"}), 200
+
+        if not text_body:
+            print("[WEBHOOK] Skipped: empty text body")
+            return jsonify({"status": "ok"}), 200
+
+        if not wa_id:
+            print("[WEBHOOK] Skipped: missing waId")
+            return jsonify({"status": "ok"}), 200
+
+        print(f"[WEBHOOK] Processing text from {sender_name or wa_id}: {text_body[:200]}")
+
+        if not BRAIN_FILE.exists():
+            print(f"[WEBHOOK] ERROR: brain file missing at {BRAIN_FILE}")
+            return jsonify({"status": "ok"}), 200
+
+        # Run the twin. order_context is empty here — webhook doesn't have Shopify info.
+        classification, reply, _raw = draft_reply_logic(text_body, "")
+
+        if not classification or not reply:
+            print(
+                f"[WEBHOOK] Twin returned empty result "
+                f"(classification={classification!r}, reply_len={len(reply)}). Skipping dispatch."
+            )
+            return jsonify({"status": "ok"}), 200
+
+        sender_info = f"{sender_name} ({wa_id})" if sender_name else wa_id
+
+        if classification == "AUTO":
+            send_whatsapp_reply(wa_id, reply)
+            print(f"[AUTO] Replied to {wa_id}")
+        elif classification == "DRAFT+APPROVE":
+            send_telegram_notification(
+                classification, text_body, reply, sender_info=sender_info
+            )
+            print(f"[DRAFT] Notified founder for {wa_id}")
+        elif classification == "ESCALATE":
+            send_telegram_notification(
+                classification, text_body, reply, sender_info=sender_info
+            )
+            print(f"[ESCALATE] Notified founder for {wa_id}")
+        else:
+            print(f"[WEBHOOK] Unknown classification {classification!r} — no dispatch")
+
+        print("=" * 60 + "\n")
+        return jsonify({"status": "ok"}), 200
+
+    except Exception as e:
+        # Catch-all so we always respond 200 to WATI no matter what.
+        print(f"[WEBHOOK] EXCEPTION: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        print("=" * 60 + "\n")
+        return jsonify({"status": "ok"}), 200
 
 
 if __name__ == "__main__":
