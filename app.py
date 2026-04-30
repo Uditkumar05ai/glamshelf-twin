@@ -157,9 +157,9 @@ def send_telegram_notification(
 def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
     """Send an outbound WhatsApp message to a customer via WATI.
 
-    WATI's sendSessionMessage endpoint takes `messageText` as a URL query
-    parameter (NOT in the JSON body). The body must be an empty object.
-    Putting messageText in the body causes a 405 Not Allowed.
+    WATI's sendSessionMessage endpoint takes `messageText` in the JSON body
+    (this account's API surface — earlier docs suggested a query parameter,
+    which returned 405 against this endpoint).
 
     Used for AUTO-classified replies in the /webhook handler. All failures
     are logged and swallowed — the webhook must always return 200 to WATI
@@ -175,20 +175,17 @@ def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
         "Authorization": f"Bearer {WATI_API_KEY}",
         "Content-Type": "application/json",
     }
-    params = {"messageText": reply_text}
-    payload: dict = {}
+    payload = {"messageText": reply_text}
 
-    # Log the exact URL (with messageText URL-encoded) and body that we'll
-    # send, so any future WATI errors can be diagnosed from the logs alone.
-    full_url = requests.Request("POST", url, params=params).prepare().url
-    print(f"[WATI] POST {full_url}")
-    print(f"[WATI] Body: {payload}")
+    # Log the exact URL and body we'll send, so any future WATI errors
+    # can be diagnosed from the logs alone.
+    print(f"[WATI] POST {url}")
+    print(f"[WATI] Body keys: {list(payload.keys())} (messageText {len(reply_text)} chars)")
 
     try:
         response = requests.post(
             url,
             headers=headers,
-            params=params,
             json=payload,
             timeout=WATI_TIMEOUT_SECONDS,
         )
