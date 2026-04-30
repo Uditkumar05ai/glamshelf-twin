@@ -155,15 +155,29 @@ def send_telegram_notification(
 
 
 def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
-    """Send an outbound WhatsApp message to a customer via WATI.
+    """Send an outbound WhatsApp text message to a customer via WATI.
 
-    WATI's sendSessionMessage endpoint takes `messageText` in the JSON body
-    (this account's API surface — earlier docs suggested a query parameter,
-    which returned 405 against this endpoint).
+    Endpoint choice — sendSessionMessage vs sendTemplateMessage:
+      - /api/v1/sendSessionMessage/{wa_id} — used for replies WITHIN the
+        24-hour session window after a customer's last inbound message.
+        This is always our case: auto-replies fire only in direct response
+        to a webhook event, so we're guaranteed to be in-session.
+      - /api/v1/sendTemplateMessage — required for messages OUTSIDE the
+        24h window, must use a pre-approved HSM template, takes different
+        fields (messageType, template name, parameters). Not used here.
 
-    Used for AUTO-classified replies in the /webhook handler. All failures
-    are logged and swallowed — the webhook must always return 200 to WATI
-    or WATI will retry and we'll send duplicates.
+    Field shape: sendSessionMessage with plain text only needs
+    `{"messageText": "..."}`. Fields like messageType / isHSM /
+    conversationId belong to sendTemplateMessage and would be ignored
+    (or rejected) here.
+
+    IMPORTANT — WATI returns HTTP 200 even on logical failures. The real
+    outcome lives in the JSON body as {"result": true|false, "info": ...}.
+    We log the full response body so any failures are visible in Render
+    logs, and we treat result=false as a failure even on HTTP 200.
+
+    All failures are logged and swallowed — the /webhook handler must
+    always return 200 to WATI to prevent retries / duplicate replies.
     """
     if not WATI_API_KEY or not WATI_ENDPOINT:
         print("[WATI] Skipped: WATI_API_KEY or WATI_ENDPOINT not set")
@@ -177,10 +191,8 @@ def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
     }
     payload = {"messageText": reply_text}
 
-    # Log the exact URL and body we'll send, so any future WATI errors
-    # can be diagnosed from the logs alone.
     print(f"[WATI] POST {url}")
-    print(f"[WATI] Body keys: {list(payload.keys())} (messageText {len(reply_text)} chars)")
+    print(f"[WATI] Body: {payload}")
 
     try:
         response = requests.post(
@@ -189,13 +201,26 @@ def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
             json=payload,
             timeout=WATI_TIMEOUT_SECONDS,
         )
-        if response.ok:
+
+        # Log the full response body — WATI's actual status is here, not
+        # just in the HTTP code. Truncated to 1000 chars to stay readable.
+        body_preview = (response.text or "(empty body)")[:1000]
+        print(f"[WATI] HTTP {response.status_code}")
+        print(f"[WATI] Response body: {body_preview}")
+
+        # Parse the response and surface result=false even on HTTP 200.
+        try:
+            data = response.json()
+        except ValueError:
+            data = None
+
+        if isinstance(data, dict) and data.get("result") is False:
+            info = data.get("info") or data.get("message") or "(no detail)"
+            print(f"[WATI] API rejected the message: {info}")
+        elif response.ok:
             print(f"[WATI] Sent reply to {wa_id} ({len(reply_text)} chars)")
         else:
-            print(
-                f"[WATI] Returned {response.status_code}: "
-                f"{response.text[:300]}"
-            )
+            print(f"[WATI] HTTP failure {response.status_code}")
     except requests.RequestException as e:
         print(f"[WATI] Network error: {type(e).__name__}: {e}")
     except Exception as e:
