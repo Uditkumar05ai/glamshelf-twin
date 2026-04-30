@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import traceback
+from collections import deque
 from functools import wraps
 from pathlib import Path
 
@@ -77,6 +78,19 @@ WATI_TIMEOUT_SECONDS = 10
 # event where waId equals this number — prevents the twin from replying to
 # itself if WATI ever loops outbound / own messages through the webhook.
 BUSINESS_NUMBER = os.environ.get("BUSINESS_NUMBER", "919217470151")
+
+# Founder's personal WhatsApp number. Defaults to the same value as
+# BUSINESS_NUMBER but can be set separately on Render if the founder's
+# personal phone differs from the registered business number. Both are
+# blocked from receiving auto-replies, both are skipped on inbound.
+OWNER_NUMBER = os.environ.get("OWNER_NUMBER", "919217470151")
+
+# In-memory dedup of recent inbound message IDs. Best-effort:
+#   - Doesn't survive worker restarts
+#   - Isn't shared across gunicorn workers (Render uses 1 worker by default)
+# But it stops the common loop case (WATI re-firing the same message id)
+# within a single worker, which is what we observed in the spam logs.
+_seen_ids: deque = deque(maxlen=500)
 
 # Anthropic client picks up ANTHROPIC_API_KEY from the environment.
 client = Anthropic()
@@ -154,6 +168,16 @@ def send_telegram_notification(
         print(f"[TG] Unexpected error: {type(e).__name__}: {e}")
 
 
+def normalize_wa(number: str) -> str:
+    """Reduce a phone number to comparable digits.
+
+    Strips non-digit characters and any leading zeros, so "+91 92174 70151",
+    "0919217470151", and "919217470151" all compare equal. Used for safe
+    cross-format equality checks against BUSINESS_NUMBER / OWNER_NUMBER.
+    """
+    return "".join(c for c in (number or "") if c.isdigit()).lstrip("0")
+
+
 def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
     """Send an outbound WhatsApp text message to a customer via WATI.
 
@@ -183,6 +207,14 @@ def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
     """
     if not WATI_API_KEY or not WATI_ENDPOINT:
         print("[WATI] Skipped: WATI_API_KEY or WATI_ENDPOINT not set")
+        return
+
+    # Defense in depth: never auto-send to the business or owner number,
+    # even if some future change in the inbound filter ever lets one through.
+    # Compared on normalized digits so format quirks can't slip past.
+    target = normalize_wa(wa_id)
+    if target and target in {normalize_wa(BUSINESS_NUMBER), normalize_wa(OWNER_NUMBER)}:
+        print(f"[WATI] BLOCKED outbound to protected number {wa_id}")
         return
 
     endpoint = WATI_ENDPOINT.rstrip("/")
@@ -510,6 +542,19 @@ def webhook():
             f"sender={sender_name!r} msg_id={msg_id!r}"
         )
 
+        # PRIMARY LOOP FIX — skip outbound/echo events.
+        # WATI fires webhook events for OUR replies too, not just inbound
+        # customer messages. owner / isOwner / fromMe are the various flags
+        # WATI uses across plans / endpoints to mark "we sent this".
+        if data.get("owner") or data.get("isOwner") or data.get("fromMe"):
+            print(
+                f"[WEBHOOK] Skipped: outbound/echo event "
+                f"(owner={data.get('owner')!r}, "
+                f"isOwner={data.get('isOwner')!r}, "
+                f"fromMe={data.get('fromMe')!r})"
+            )
+            return jsonify({"status": "ok"}), 200
+
         # Skip non-text events (images, audio, video, documents, stickers, status updates).
         if message_type != "text":
             print(f"[WEBHOOK] Skipped: non-text message type {message_type!r}")
@@ -523,11 +568,22 @@ def webhook():
             print("[WEBHOOK] Skipped: missing waId")
             return jsonify({"status": "ok"}), 200
 
-        # Don't process messages from our own business number — prevents
-        # the twin from replying to itself if WATI loops outbound events.
-        if wa_id == BUSINESS_NUMBER:
-            print(f"[WEBHOOK] Skipped: message from business number {wa_id}")
+        # Don't process messages from our own business or owner number.
+        # Compared on normalized digits so format quirks (+91, 0091, spaces,
+        # etc.) can't slip past the equality check.
+        normalized = normalize_wa(wa_id)
+        if normalized in {normalize_wa(BUSINESS_NUMBER), normalize_wa(OWNER_NUMBER)}:
+            print(f"[WEBHOOK] Skipped: message from protected number {wa_id}")
             return jsonify({"status": "ok"}), 200
+
+        # Best-effort dedup: skip if we've recently processed this same
+        # message id in this worker (handles WATI retries and any echo
+        # paths the owner/eventType filters above don't catch).
+        if msg_id and msg_id in _seen_ids:
+            print(f"[WEBHOOK] Skipped: duplicate message id {msg_id}")
+            return jsonify({"status": "ok"}), 200
+        if msg_id:
+            _seen_ids.append(msg_id)
 
         print(f"[WEBHOOK] Processing text from {sender_name or wa_id}: {text_body[:200]}")
 
