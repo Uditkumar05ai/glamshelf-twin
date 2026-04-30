@@ -166,10 +166,12 @@ def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
         24h window, must use a pre-approved HSM template, takes different
         fields (messageType, template name, parameters). Not used here.
 
-    Field shape: sendSessionMessage with plain text only needs
-    `{"messageText": "..."}`. Fields like messageType / isHSM /
-    conversationId belong to sendTemplateMessage and would be ignored
-    (or rejected) here.
+    Field shape: sendSessionMessage takes `messageText` as a URL QUERY
+    PARAMETER, not a JSON body field. Putting it in the body causes WATI
+    to respond with {"result": false, "info": "message text can not be
+    empty"} (HTTP 200 — see the result-check note below). The body is
+    sent empty. Fields like messageType / isHSM / conversationId belong
+    to sendTemplateMessage and would be ignored or rejected here.
 
     IMPORTANT — WATI returns HTTP 200 even on logical failures. The real
     outcome lives in the JSON body as {"result": true|false, "info": ...}.
@@ -189,16 +191,20 @@ def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
         "Authorization": f"Bearer {WATI_API_KEY}",
         "Content-Type": "application/json",
     }
-    payload = {"messageText": reply_text}
+    params = {"messageText": reply_text}
 
-    print(f"[WATI] POST {url}")
-    print(f"[WATI] Body: {payload}")
+    # Log the fully-prepared URL (with messageText URL-encoded) so we can
+    # see exactly what WATI receives.
+    full_url = requests.Request("POST", url, params=params).prepare().url
+    print(f"[WATI] POST {full_url}")
+    print(f"[WATI] Body: {{}} (empty — messageText is in the query string)")
 
     try:
         response = requests.post(
             url,
             headers=headers,
-            json=payload,
+            params=params,
+            json={},
             timeout=WATI_TIMEOUT_SECONDS,
         )
 
