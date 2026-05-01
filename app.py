@@ -13,10 +13,12 @@ Auth: ANTHROPIC_API_KEY environment variable.
 
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import time
 import traceback
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
 
@@ -86,6 +88,14 @@ BUSINESS_NUMBER = os.environ.get("BUSINESS_NUMBER", "919217470151")
 # blocked from receiving auto-replies, both are skipped on inbound.
 OWNER_NUMBER = os.environ.get("OWNER_NUMBER", "919217470151")
 
+# Dashboard config — DASHBOARD_KEY gates /dashboard-data; override on Render.
+DASHBOARD_KEY = os.environ.get("DASHBOARD_KEY", "changeme")
+
+# SQLite path for message logs. Spec asks for /tmp/glamshelf_logs.db; using
+# tempfile.gettempdir() resolves to /tmp on Render Linux and stays portable
+# for local Windows dev — same effective path on production.
+DB_PATH = os.path.join(tempfile.gettempdir(), "glamshelf_logs.db")
+
 # Recent message-id dedup. Backed by a short-lived cache file in the OS
 # temp dir so the dedup set survives worker restarts within a single
 # deploy — without this, every Render worker recycle re-opens the
@@ -151,6 +161,87 @@ def _persist_seen_id(msg_id: str) -> None:
 
 _seen_ids: set[str] = _load_seen_ids()
 print(f"[DEDUP] Loaded {len(_seen_ids)} recent message ids from {DEDUP_CACHE_FILE}")
+
+
+def _init_db() -> None:
+    """Create the message_logs table and supporting indexes if missing.
+
+    Schema:
+      id          INTEGER  primary key
+      ts          REAL     unix timestamp (float)
+      wa_id       TEXT     customer phone (or empty for early errors)
+      sender_name TEXT     WATI senderName field
+      msg_text    TEXT     inbound text body
+      status      TEXT     AUTO / ESCALATE / DEDUP / PROTECTED / ERROR
+      reply_text  TEXT     drafted reply (AUTO/ESCALATE only)
+      latency_ms  INTEGER  webhook→dispatch elapsed ms (None for skips)
+      error       TEXT     stringified exception (ERROR rows only)
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS message_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                wa_id TEXT,
+                sender_name TEXT,
+                msg_text TEXT,
+                status TEXT NOT NULL,
+                reply_text TEXT,
+                latency_ms INTEGER,
+                error TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_ts ON message_logs(ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_status ON message_logs(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_wa_id ON message_logs(wa_id)")
+        conn.commit()
+        conn.close()
+        print(f"[DB] Initialized {DB_PATH}")
+    except Exception as e:
+        print(f"[DB] Failed to init: {type(e).__name__}: {e}")
+
+
+def _log_message(
+    wa_id: str,
+    sender_name: str,
+    msg_text: str,
+    status: str,
+    reply_text: str | None = None,
+    latency_ms: int | None = None,
+    error: str | None = None,
+) -> None:
+    """Insert one row into message_logs.
+
+    All failures swallowed — a DB problem must never break the webhook
+    response (we always return 200 to WATI).
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO message_logs "
+            "(ts, wa_id, sender_name, msg_text, status, reply_text, latency_ms, error) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                time.time(),
+                wa_id,
+                sender_name,
+                msg_text,
+                status,
+                reply_text,
+                latency_ms,
+                error,
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[DB] _log_message failed: {type(e).__name__}: {e}")
+
+
+_init_db()
 
 # Anthropic client picks up ANTHROPIC_API_KEY from the environment.
 client = Anthropic()
@@ -505,12 +596,24 @@ def healthz():
     """Liveness probe. Render can ping this to confirm the deploy works.
     Reports whether brain.md is present so a misconfigured deploy is obvious.
     Intentionally NOT behind login_required — Render needs to hit it without auth."""
+    db_status = "ok"
+    total_logged = 0
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        total_logged = conn.execute("SELECT COUNT(*) FROM message_logs").fetchone()[0]
+        conn.close()
+    except Exception as e:
+        db_status = f"error: {type(e).__name__}: {e}"
+
     return jsonify({
         "status": "ok",
         "brain_present": BRAIN_FILE.exists(),
         "brain_path": str(BRAIN_FILE),
         "model": MODEL,
         "anthropic_api_key_set": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        "db": db_status,
+        "total_logged": total_logged,
+        "seen_ids_cached": len(_seen_ids),
     })
 
 
@@ -584,6 +687,10 @@ def webhook():
     """
     print("\n" + "=" * 60)
     try:
+        # Start timer here so latency_ms covers the entire handler — the
+        # except block also references t_start so it must be set before
+        # anything that could raise inside the try.
+        t_start = time.time()
         data = request.get_json(silent=True) or {}
         message_type = (data.get("type") or "").strip().lower()
         wa_id = (data.get("waId") or "").strip()
@@ -621,6 +728,7 @@ def webhook():
         normalized = normalize_wa(wa_id)
         if normalized in {normalize_wa(BUSINESS_NUMBER), normalize_wa(OWNER_NUMBER)}:
             print(f"[WEBHOOK] Skipped: message from protected number {wa_id}")
+            _log_message(wa_id, sender_name, text_body, status="PROTECTED")
             return jsonify({"status": "ok"}), 200
 
         # PRIMARY LOOP DEFENSE — dedup by message id.
@@ -631,6 +739,7 @@ def webhook():
         # restarts is what stops the loop after a redeploy / worker recycle.
         if msg_id and msg_id in _seen_ids:
             print(f"[WEBHOOK] Skipped: duplicate message id {msg_id}")
+            _log_message(wa_id, sender_name, text_body, status="DEDUP")
             return jsonify({"status": "ok"}), 200
         if msg_id:
             _seen_ids.add(msg_id)
@@ -657,16 +766,31 @@ def webhook():
         if classification == "AUTO":
             send_whatsapp_reply(wa_id, reply)
             print(f"[AUTO] Replied to {wa_id}")
+            elapsed_ms = int((time.time() - t_start) * 1000)
+            _log_message(
+                wa_id, sender_name, text_body,
+                status="AUTO", reply_text=reply, latency_ms=elapsed_ms,
+            )
         elif classification == "DRAFT+APPROVE":
             send_telegram_notification(
                 classification, text_body, reply, sender_info=sender_info
             )
             print(f"[DRAFT] Notified founder for {wa_id}")
+            elapsed_ms = int((time.time() - t_start) * 1000)
+            _log_message(
+                wa_id, sender_name, text_body,
+                status="DRAFT", reply_text=reply, latency_ms=elapsed_ms,
+            )
         elif classification == "ESCALATE":
             send_telegram_notification(
                 classification, text_body, reply, sender_info=sender_info
             )
             print(f"[ESCALATE] Notified founder for {wa_id}")
+            elapsed_ms = int((time.time() - t_start) * 1000)
+            _log_message(
+                wa_id, sender_name, text_body,
+                status="ESCALATE", reply_text=reply, latency_ms=elapsed_ms,
+            )
         else:
             print(f"[WEBHOOK] Unknown classification {classification!r} — no dispatch")
 
@@ -677,8 +801,201 @@ def webhook():
         # Catch-all so we always respond 200 to WATI no matter what.
         print(f"[WEBHOOK] EXCEPTION: {type(e).__name__}: {e}")
         traceback.print_exc()
+        # Log the error too — wrapped in its own try/except because at this
+        # point any of t_start / wa_id / sender_name / text_body could be
+        # undefined if the exception fired very early.
+        try:
+            elapsed_ms = int((time.time() - locals().get("t_start", time.time())) * 1000)
+            _log_message(
+                locals().get("wa_id", "") or "",
+                locals().get("sender_name", "") or "",
+                locals().get("text_body", "") or "",
+                status="ERROR",
+                error=str(e),
+                latency_ms=elapsed_ms,
+            )
+        except Exception:
+            pass
         print("=" * 60 + "\n")
         return jsonify({"status": "ok"}), 200
+
+
+@app.route("/dashboard-data", methods=["GET"])
+def dashboard_data():
+    """JSON snapshot of message logs for the founder's live dashboard.
+
+    Auth: ?key=<DASHBOARD_KEY> query param. Override DASHBOARD_KEY in
+    Render env vars; the default 'changeme' is intentionally embarrassing
+    so the env var is the only sane way to use this in production.
+
+    Sections:
+      kpis           — today's counts and latency stats (IST midnight onward)
+      conversations  — last 50 actionable rows (excludes DEDUP/PROTECTED)
+      customers      — per-wa_id summary (msg_count, last_seen, last_status)
+      daily_volume   — last 7 days, grouped by IST date (YYYY-MM-DD)
+      error_log      — last 20 ERROR / ESCALATE / slow (>5s) rows
+      bulk_spike     — distinct senders in last 30min, is_spike flag if >=5
+    """
+    if request.args.get("key") != DASHBOARD_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+
+    try:
+        # IST midnight as a unix timestamp — matches Udit's working day.
+        ist = timezone(timedelta(hours=5, minutes=30))
+        now_ist = datetime.now(ist)
+        midnight_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+        midnight_unix = midnight_ist.timestamp()
+
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+
+        # ---- KPIs (today) ----
+        cur.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                COALESCE(SUM(CASE WHEN status='AUTO' THEN 1 END), 0) AS auto_replied,
+                COALESCE(SUM(CASE WHEN status='ESCALATE' THEN 1 END), 0) AS escalated,
+                COALESCE(SUM(CASE WHEN status='DEDUP' THEN 1 END), 0) AS dedup_skips,
+                COALESCE(SUM(CASE WHEN status='PROTECTED' THEN 1 END), 0) AS protected_blocks,
+                COALESCE(SUM(CASE WHEN status='ERROR' THEN 1 END), 0) AS errors,
+                AVG(latency_ms) AS avg_latency_ms,
+                MAX(latency_ms) AS max_latency_ms
+            FROM message_logs WHERE ts >= ?
+            """,
+            (midnight_unix,),
+        )
+        r = cur.fetchone()
+        kpis = {
+            "total": r[0] or 0,
+            "auto_replied": r[1] or 0,
+            "escalated": r[2] or 0,
+            "dedup_skips": r[3] or 0,
+            "protected_blocks": r[4] or 0,
+            "errors": r[5] or 0,
+            "avg_latency_ms": int(r[6]) if r[6] is not None else None,
+            "max_latency_ms": int(r[7]) if r[7] is not None else None,
+        }
+
+        # ---- Conversations: last 50, exclude DEDUP/PROTECTED ----
+        cur.execute(
+            """
+            SELECT id, ts, wa_id, sender_name, msg_text, status, reply_text, latency_ms, error
+            FROM message_logs
+            WHERE status NOT IN ('DEDUP', 'PROTECTED')
+            ORDER BY ts DESC LIMIT 50
+            """
+        )
+        conversations = [
+            {
+                "id": row[0], "ts": row[1], "wa_id": row[2],
+                "sender_name": row[3], "msg_text": row[4], "status": row[5],
+                "reply_text": row[6], "latency_ms": row[7], "error": row[8],
+            }
+            for row in cur.fetchall()
+        ]
+
+        # ---- Customers: aggregated per wa_id, with last_status ----
+        # Self-join on (wa_id, MAX(ts)) is portable across SQLite versions and
+        # avoids a per-row correlated subquery.
+        cur.execute(
+            """
+            SELECT
+                ml.wa_id,
+                ml.sender_name,
+                cnt.msg_count,
+                ml.ts AS last_seen,
+                ml.status AS last_status
+            FROM message_logs ml
+            JOIN (
+                SELECT wa_id, COUNT(*) AS msg_count, MAX(ts) AS max_ts
+                FROM message_logs
+                WHERE wa_id IS NOT NULL AND wa_id != ''
+                GROUP BY wa_id
+            ) cnt ON ml.wa_id = cnt.wa_id AND ml.ts = cnt.max_ts
+            ORDER BY ml.ts DESC
+            LIMIT 100
+            """
+        )
+        customers = [
+            {
+                "wa_id": row[0], "sender_name": row[1],
+                "msg_count": row[2], "last_seen": row[3], "last_status": row[4],
+            }
+            for row in cur.fetchall()
+        ]
+
+        # ---- Daily volume: last 7 days, IST date buckets ----
+        cur.execute(
+            """
+            SELECT
+                DATE(ts, 'unixepoch', '+5 hours', '+30 minutes') AS day_ist,
+                COUNT(*) AS total,
+                COALESCE(SUM(CASE WHEN status='AUTO' THEN 1 END), 0) AS auto_replied,
+                COALESCE(SUM(CASE WHEN status='ESCALATE' THEN 1 END), 0) AS escalated
+            FROM message_logs
+            WHERE ts >= ?
+            GROUP BY day_ist
+            ORDER BY day_ist DESC
+            """,
+            (time.time() - 7 * 86400,),
+        )
+        daily_volume = [
+            {
+                "date": row[0], "total": row[1],
+                "auto_replied": row[2], "escalated": row[3],
+            }
+            for row in cur.fetchall()
+        ]
+
+        # ---- Error log: last 20 noteworthy rows ----
+        cur.execute(
+            """
+            SELECT id, ts, wa_id, sender_name, msg_text, status, latency_ms, error
+            FROM message_logs
+            WHERE status IN ('ERROR', 'ESCALATE') OR latency_ms > 5000
+            ORDER BY ts DESC LIMIT 20
+            """
+        )
+        error_log = [
+            {
+                "id": row[0], "ts": row[1], "wa_id": row[2],
+                "sender_name": row[3], "msg_text": row[4], "status": row[5],
+                "latency_ms": row[6], "error": row[7],
+            }
+            for row in cur.fetchall()
+        ]
+
+        # ---- Bulk spike: distinct senders in last 30 min ----
+        cur.execute(
+            """
+            SELECT COUNT(DISTINCT wa_id) FROM message_logs
+            WHERE ts >= ? AND wa_id IS NOT NULL AND wa_id != ''
+            """,
+            (time.time() - 30 * 60,),
+        )
+        distinct_count = cur.fetchone()[0] or 0
+        bulk_spike = {
+            "distinct_senders_last_30min": distinct_count,
+            "is_spike": distinct_count >= 5,
+        }
+
+        conn.close()
+
+        return jsonify({
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "kpis": kpis,
+            "conversations": conversations,
+            "customers": customers,
+            "daily_volume": daily_volume,
+            "error_log": error_log,
+            "bulk_spike": bulk_spike,
+        })
+
+    except Exception as e:
+        print(f"[DASHBOARD] error: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
 
 if __name__ == "__main__":
