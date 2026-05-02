@@ -351,6 +351,7 @@ a, button, [role="button"] { transition: color var(--transition), background var
 .dot-green { background: var(--color-success); animation: pulse 2s ease-in-out infinite; }
 .dot-yellow { background: var(--color-gold); }
 .dot-red { background: var(--color-error); animation: pulse 1s ease-in-out infinite; }
+.dot-grey { background: var(--color-text-faint); }
 .health-val { font-size: 1.25rem; font-weight: 700; font-variant-numeric: tabular-nums; }
 .health-sub { font-size: 0.7rem; color: var(--color-text-muted); margin-top: 2px; }
 
@@ -620,76 +621,87 @@ a, button, [role="button"] { transition: color var(--transition), background var
     <!-- ===== HEALTH SECTION ===== -->
     <section class="page-section" id="section-health">
       <div class="health-grid">
+        <!-- Card 1: Webhook -->
         <div class="health-card">
           <div class="health-header">
             <span class="health-title">Webhook</span>
-            <div class="health-status"><div class="dot dot-green"></div> Operational</div>
+            <div class="health-status" id="webhook-status"><div class="dot dot-grey"></div> No data</div>
           </div>
-          <div class="health-val">100%</div>
-          <div class="health-sub">Uptime today (48/48 hits)</div>
+          <div class="health-val" id="webhook-uptime-val">—</div>
+          <div class="health-sub" id="webhook-uptime-sub">Loading…</div>
           <div class="latency-bar-wrap">
-            <div style="display:flex;justify-content:space-between;font-size:0.6rem;color:var(--color-text-faint)"><span>Success rate</span><span>48/48</span></div>
-            <div class="latency-track"><div class="latency-fill" style="width:100%;background:var(--color-success)"></div></div>
+            <div style="display:flex;justify-content:space-between;font-size:0.6rem;color:var(--color-text-faint)"><span>Success rate</span><span id="webhook-ratio">—</span></div>
+            <div class="latency-track"><div class="latency-fill" id="webhook-uptime-bar" style="width:0%;background:var(--color-success)"></div></div>
           </div>
         </div>
+
+        <!-- Card 2: Dedup -->
         <div class="health-card">
           <div class="health-header">
             <span class="health-title">Dedup Engine</span>
-            <div class="health-status"><div class="dot dot-green"></div> Active</div>
+            <div class="health-status" id="dedup-status"><div class="dot dot-grey"></div> Idle</div>
           </div>
           <div class="health-val" id="dedup-count">0</div>
           <div class="health-sub">Dupes blocked today</div>
           <div class="latency-bar-wrap">
-            <div style="display:flex;justify-content:space-between;font-size:0.6rem;color:var(--color-text-faint)"><span>Block rate</span><span>26%</span></div>
-            <div class="latency-track"><div class="latency-fill" style="width:26%;background:var(--color-gold)"></div></div>
+            <div style="display:flex;justify-content:space-between;font-size:0.6rem;color:var(--color-text-faint)"><span>Block rate</span><span id="dedup-rate-label">—</span></div>
+            <div class="latency-track"><div class="latency-fill" id="dedup-rate-bar" style="width:0%;background:var(--color-gold)"></div></div>
           </div>
         </div>
+
+        <!-- Card 3: Latency -->
         <div class="health-card">
           <div class="health-header">
             <span class="health-title">Response Latency</span>
-            <div class="health-status"><div class="dot dot-green"></div> Normal</div>
+            <div class="health-status" id="latency-status"><div class="dot dot-grey"></div> No data</div>
           </div>
-          <div class="health-val">1.2s</div>
+          <div class="health-val" id="latency-avg">—</div>
           <div class="health-sub" id="latency-p99">Avg · p99: —</div>
           <div class="latency-bar-wrap">
-            <div style="display:flex;justify-content:space-between;font-size:0.6rem;color:var(--color-text-faint)"><span>vs 3s target</span><span>✓</span></div>
+            <div style="display:flex;justify-content:space-between;font-size:0.6rem;color:var(--color-text-faint)"><span>vs 3s target</span><span id="latency-target">—</span></div>
             <div class="latency-track"><div class="latency-fill" id="latency-bar" style="width:0%;background:var(--color-primary)"></div></div>
           </div>
         </div>
+
+        <!-- Card 4: Protected Numbers -->
         <div class="health-card">
           <div class="health-header">
             <span class="health-title">Protected Numbers</span>
-            <div class="health-status"><div class="dot dot-green"></div> Enforced</div>
+            <div class="health-status" id="protected-status"><div class="dot dot-grey"></div> Loading</div>
           </div>
-          <div class="health-val">3</div>
-          <div class="health-sub">In blocklist · 0 bypasses</div>
+          <div class="health-val" id="protected-val">—</div>
+          <div class="health-sub" id="protected-sub">In blocklist · 0 bypasses</div>
           <div class="latency-bar-wrap">
-            <div style="display:flex;justify-content:space-between;font-size:0.6rem;color:var(--color-text-faint)"><span>Blocked msgs</span><span>0</span></div>
-            <div class="latency-track"><div class="latency-fill" style="width:0%;background:var(--color-error)"></div></div>
+            <div style="display:flex;justify-content:space-between;font-size:0.6rem;color:var(--color-text-faint)"><span>Blocked msgs today</span><span id="protected-blocks-label">0</span></div>
+            <div class="latency-track"><div class="latency-fill" id="protected-blocks-bar" style="width:0%;background:var(--color-error)"></div></div>
           </div>
         </div>
+
+        <!-- Card 5: Claude API -->
         <div class="health-card">
           <div class="health-header">
             <span class="health-title">Claude API</span>
-            <div class="health-status"><div class="dot dot-yellow"></div> Degraded</div>
+            <div class="health-status" id="claude-status"><div class="dot dot-grey"></div> No data</div>
           </div>
-          <div class="health-val" id="claude-rate" style="color:var(--color-gold)">—</div>
-          <div class="health-sub" id="claude-errors">Loading…</div>
+          <div class="health-val" id="claude-rate">—</div>
+          <div class="health-sub" id="claude-errors">No attempts yet</div>
           <div class="latency-bar-wrap">
-            <div style="display:flex;justify-content:space-between;font-size:0.6rem;color:var(--color-text-faint)"><span>Success</span><span>46/48</span></div>
-            <div class="latency-track"><div class="latency-fill" id="claude-bar" style="width:100%;background:var(--color-gold)"></div></div>
+            <div style="display:flex;justify-content:space-between;font-size:0.6rem;color:var(--color-text-faint)"><span>Success</span><span id="claude-ratio">—</span></div>
+            <div class="latency-track"><div class="latency-fill" id="claude-bar" style="width:0%;background:var(--color-success)"></div></div>
           </div>
         </div>
+
+        <!-- Card 6: Render Server -->
         <div class="health-card">
           <div class="health-header">
             <span class="health-title">Render Server</span>
-            <div class="health-status"><div class="dot dot-green"></div> Online</div>
+            <div class="health-status" id="render-status-line"><div class="dot dot-grey"></div> Loading</div>
           </div>
-          <div class="health-val">✓</div>
-          <div class="health-sub">All endpoints healthy</div>
+          <div class="health-val" id="render-val">—</div>
+          <div class="health-sub" id="render-sub">Loading…</div>
           <div class="latency-bar-wrap">
-            <div style="display:flex;justify-content:space-between;font-size:0.6rem;color:var(--color-text-faint)"><span>Memory</span><span>312MB / 512MB</span></div>
-            <div class="latency-track"><div class="latency-fill" style="width:61%;background:var(--color-primary)"></div></div>
+            <div style="display:flex;justify-content:space-between;font-size:0.6rem;color:var(--color-text-faint)"><span id="render-extra-left">DB total</span><span id="render-extra-right">—</span></div>
+            <div class="latency-track"><div class="latency-fill" id="render-extra-bar" style="width:100%;background:var(--color-primary)"></div></div>
           </div>
         </div>
       </div>
@@ -755,7 +767,7 @@ function renderAll(data) {
   renderFunnel(data.kpis);
   renderBarChart(data.daily_volume || []);
   renderBulkTable(data.bulk_spike, data.conversations);
-  renderHealthPanel(data.kpis, data.error_log || []);
+  renderHealthPanel(data.health || {}, data.error_log || []);
   renderLogs(data.error_log || []);
   updateUnreadBadge(data.conversations);
   checkBulkSpike(data.bulk_spike);
@@ -1010,30 +1022,101 @@ function renderBulkTable(spike, convos) {
 }
 
 // ===== HEALTH PANEL =====
-function renderHealthPanel(k, errorLog) {
-  if (!k) return;
-  const errs = k.errors || 0;
-  const dedup = k.dedup_skips || 0;
-  const latencyMs = k.avg_latency_ms || 0;
-  const p99Ms = k.max_latency_ms || 0;
+// Tiny DOM helpers — silent no-op if the target element doesn't exist.
+function setText(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = value;
+}
+function setBarWidth(id, pct) {
+  const el = document.getElementById(id);
+  if (el) el.style.width = Math.max(0, Math.min(100, pct || 0)) + "%";
+}
+function setStatus(id, dotClass, label) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.innerHTML = `<div class="dot ${dotClass}"></div> ${label}`;
+}
+// Status thresholds: green ≥99%, yellow ≥95%, red below.
+function statusFromPct(pct, okLabel, midLabel, badLabel) {
+  if (pct == null) return ["dot-grey", "No data"];
+  if (pct >= 99)   return ["dot-green",  okLabel];
+  if (pct >= 95)   return ["dot-yellow", midLabel];
+  return            ["dot-red",          badLabel];
+}
 
-  // Claude API status
-  const total = (k.total || 0) + errs;
-  const successRate = total > 0 ? Math.round(((total - errs) / total) * 100) : 100;
-  const claudeStatus = errs === 0 ? "Operational" : errs <= 2 ? "Degraded" : "Issues";
-  const claudeDot = errs === 0 ? "dot-green" : errs <= 2 ? "dot-yellow" : "dot-red";
+function renderHealthPanel(health, errorLog) {
+  if (!health) return;
 
-  document.getElementById("claude-rate") && (document.getElementById("claude-rate").textContent = successRate + "%");
-  document.getElementById("claude-errors") && (document.getElementById("claude-errors").textContent = errs + " error" + (errs !== 1 ? "s" : "") + " today");
-  document.getElementById("claude-bar") && (document.getElementById("claude-bar").style.width = successRate + "%");
+  // ----- Card 1: Webhook -----
+  const upPct  = health.webhook_uptime_pct;
+  const upTot  = health.webhook_total_today || 0;
+  const upSuc  = health.webhook_success_today || 0;
+  setText("webhook-uptime-val", upPct == null ? "—" : Math.round(upPct) + "%");
+  setText("webhook-uptime-sub", upTot > 0 ? `Uptime today (${upSuc}/${upTot} hits)` : "No traffic yet today");
+  setText("webhook-ratio", upTot > 0 ? `${upSuc}/${upTot}` : "—");
+  setBarWidth("webhook-uptime-bar", upPct);
+  const [wDot, wLbl] = statusFromPct(upPct, "Operational", "Degraded", "Issues");
+  setStatus("webhook-status", wDot, wLbl);
 
-  // Latency
-  document.getElementById("latency-avg") && (document.getElementById("latency-avg").textContent = latencyMs > 0 ? (latencyMs/1000).toFixed(1)+"s" : "—");
-  document.getElementById("latency-p99") && (document.getElementById("latency-p99").textContent = p99Ms > 0 ? "p99: "+(p99Ms/1000).toFixed(1)+"s" : "");
-  document.getElementById("latency-bar") && (document.getElementById("latency-bar").style.width = Math.min(100, Math.round((latencyMs/3000)*100)) + "%");
+  // ----- Card 2: Dedup Engine -----
+  const dedup = health.dedup_blocks_today || 0;
+  setText("dedup-count", dedup);
+  const blockRate = upTot > 0 ? Math.round((dedup / upTot) * 100) : 0;
+  setText("dedup-rate-label", upTot > 0 ? blockRate + "%" : "—");
+  setBarWidth("dedup-rate-bar", blockRate);
+  setStatus("dedup-status",
+    health.render_status === "online" ? "dot-green" : "dot-yellow",
+    health.render_status === "online" ? "Active" : "Idle");
 
-  // Dedup
-  document.getElementById("dedup-count") && (document.getElementById("dedup-count").textContent = dedup);
+  // ----- Card 3: Response Latency -----
+  const avgMs = health.avg_latency_ms;
+  const p99Ms = health.latency_p99_ms;
+  setText("latency-avg", avgMs ? (avgMs / 1000).toFixed(1) + "s" : "—");
+  setText("latency-p99", `Avg · p99: ${p99Ms ? (p99Ms / 1000).toFixed(1) + "s" : "—"}`);
+  setBarWidth("latency-bar", avgMs ? Math.round((avgMs / 3000) * 100) : 0);
+  setText("latency-target", avgMs == null ? "—" : avgMs < 3000 ? "✓" : "⚠");
+  if (avgMs == null) {
+    setStatus("latency-status", "dot-grey", "No data");
+  } else if (avgMs < 3000) {
+    setStatus("latency-status", "dot-green", "Normal");
+  } else if (avgMs < 5000) {
+    setStatus("latency-status", "dot-yellow", "Slow");
+  } else {
+    setStatus("latency-status", "dot-red", "Critical");
+  }
+
+  // ----- Card 4: Protected Numbers -----
+  const pNums = health.protected_numbers || [];
+  const pBlocks = health.protected_blocks_today || 0;
+  setText("protected-val", pNums.length);
+  setText("protected-sub", `In blocklist · 0 bypasses`);
+  setText("protected-blocks-label", pBlocks);
+  setBarWidth("protected-blocks-bar", upTot > 0 ? Math.round((pBlocks / upTot) * 100) : 0);
+  setStatus("protected-status",
+    pNums.length > 0 ? "dot-green" : "dot-red",
+    pNums.length > 0 ? "Enforced"  : "None set");
+
+  // ----- Card 5: Claude API -----
+  const cRate = health.claude_success_rate;
+  const cAtt  = health.claude_attempts_today || 0;
+  const cSuc  = health.claude_successes_today || 0;
+  const cErr  = Math.max(0, cAtt - cSuc);
+  setText("claude-rate", cRate == null ? "—" : Math.round(cRate) + "%");
+  setText("claude-errors", cAtt > 0 ? `${cErr} error${cErr !== 1 ? "s" : ""} today` : "No attempts yet");
+  setText("claude-ratio", cAtt > 0 ? `${cSuc}/${cAtt}` : "—");
+  setBarWidth("claude-bar", cRate);
+  const [clDot, clLbl] = statusFromPct(cRate, "Operational", "Degraded", "Issues");
+  setStatus("claude-status", clDot, clLbl);
+
+  // ----- Card 6: Render Server -----
+  const online = health.render_status === "online";
+  setText("render-val", online ? "✓" : "⚠");
+  setText("render-sub", online ? "All endpoints healthy" : "Server reports degraded");
+  setText("render-extra-left", "DB total");
+  setText("render-extra-right", (health.total_logged || 0) + " row" + ((health.total_logged || 0) === 1 ? "" : "s"));
+  setStatus("render-status-line",
+    online ? "dot-green" : "dot-yellow",
+    online ? "Online"    : "Degraded");
 }
 
 // ===== LOG FEED =====

@@ -13,6 +13,7 @@ Auth: ANTHROPIC_API_KEY environment variable.
 
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -91,10 +92,17 @@ OWNER_NUMBER = os.environ.get("OWNER_NUMBER", "919217470151")
 # Dashboard config — DASHBOARD_KEY gates /dashboard-data; override on Render.
 DASHBOARD_KEY = os.environ.get("DASHBOARD_KEY", "changeme")
 
-# SQLite path for message logs. Spec asks for /tmp/glamshelf_logs.db; using
-# tempfile.gettempdir() resolves to /tmp on Render Linux and stays portable
-# for local Windows dev — same effective path on production.
-DB_PATH = os.path.join(tempfile.gettempdir(), "glamshelf_logs.db")
+# SQLite path for message logs.
+#   - Legacy/local default: <tempdir>/glamshelf_logs.db (ephemeral on Render).
+#   - Production on Render: set DASHBOARD_DB_PATH to a path on a mounted
+#     persistent disk, e.g. /var/data/glamshelf_logs.db. The disk needs to
+#     be created in Render → Settings → Disks (any small size, mounted at
+#     /var/data). Without that, every redeploy still wipes the DB.
+#   - On startup, if a legacy /tmp DB exists and the persistent path is
+#     empty, _init_db() copies the file across once so historical rows
+#     aren't lost when you flip on the persistent disk.
+_LEGACY_DB_PATH = os.path.join(tempfile.gettempdir(), "glamshelf_logs.db")
+DB_PATH = os.environ.get("DASHBOARD_DB_PATH", _LEGACY_DB_PATH)
 
 # Recent message-id dedup. Backed by a short-lived cache file in the OS
 # temp dir so the dedup set survives worker restarts within a single
@@ -166,17 +174,43 @@ print(f"[DEDUP] Loaded {len(_seen_ids)} recent message ids from {DEDUP_CACHE_FIL
 def _init_db() -> None:
     """Create the message_logs table and supporting indexes if missing.
 
+    On startup also performs a one-time copy from the legacy /tmp DB to
+    the configured DB_PATH if (a) the persistent path is in use and
+    different from /tmp, (b) the legacy file exists, and (c) the
+    persistent path doesn't exist yet. This preserves any rows captured
+    before the persistent disk was wired up.
+
     Schema:
       id          INTEGER  primary key
       ts          REAL     unix timestamp (float)
       wa_id       TEXT     customer phone (or empty for early errors)
       sender_name TEXT     WATI senderName field
       msg_text    TEXT     inbound text body
-      status      TEXT     AUTO / ESCALATE / DEDUP / PROTECTED / ERROR
-      reply_text  TEXT     drafted reply (AUTO/ESCALATE only)
+      status      TEXT     AUTO / DRAFT / ESCALATE / DEDUP / PROTECTED / ERROR
+      reply_text  TEXT     drafted reply (AUTO/DRAFT/ESCALATE only)
       latency_ms  INTEGER  webhook→dispatch elapsed ms (None for skips)
       error       TEXT     stringified exception (ERROR rows only)
     """
+    # Ensure parent dir exists for persistent paths (e.g. /var/data).
+    parent = os.path.dirname(DB_PATH)
+    if parent and not os.path.isdir(parent):
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except Exception as e:
+            print(f"[DB] Failed to create parent dir {parent}: {type(e).__name__}: {e}")
+
+    # One-time legacy migration.
+    if (
+        DB_PATH != _LEGACY_DB_PATH
+        and os.path.exists(_LEGACY_DB_PATH)
+        and not os.path.exists(DB_PATH)
+    ):
+        try:
+            shutil.copy2(_LEGACY_DB_PATH, DB_PATH)
+            print(f"[DB] Migrated legacy DB {_LEGACY_DB_PATH} -> {DB_PATH}")
+        except Exception as e:
+            print(f"[DB] Legacy migration failed: {type(e).__name__}: {e}")
+
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
@@ -1009,6 +1043,74 @@ def dashboard_data():
             "is_spike": distinct_count >= 5,
         }
 
+        # ---- Health: today's webhook stats + p99 latency + status flags ----
+        # Most numbers come straight off `kpis` (already today-bucketed). We
+        # add latency_p99 (computed in Python from a sorted fetch — SQLite
+        # has no PERCENTILE function) and an all-time row count.
+        cur.execute(
+            """
+            SELECT latency_ms FROM message_logs
+            WHERE ts >= ? AND latency_ms IS NOT NULL
+            ORDER BY latency_ms ASC
+            """,
+            (midnight_unix,),
+        )
+        latencies = [row[0] for row in cur.fetchall() if row[0] is not None]
+        if latencies:
+            n = len(latencies)
+            p99_idx = max(0, min(n - 1, int(round(0.99 * (n - 1)))))
+            latency_p99_ms = int(latencies[p99_idx])
+        else:
+            latency_p99_ms = None
+
+        cur.execute("SELECT COUNT(*) FROM message_logs")
+        total_logged_all_time = cur.fetchone()[0] or 0
+
+        # Webhook uptime — fraction of today's events that didn't ERROR.
+        total_today = kpis["total"]
+        errors_today = kpis["errors"]
+        if total_today > 0:
+            webhook_uptime_pct = round(
+                (total_today - errors_today) / total_today * 100, 2
+            )
+        else:
+            webhook_uptime_pct = None
+
+        # Claude success — among events that actually reached Claude
+        # (everything except DEDUP / PROTECTED skips). DEDUP and PROTECTED
+        # short-circuit before the API call; AUTO/DRAFT/ESCALATE all imply
+        # a successful Claude response, ERROR implies a failed one.
+        claude_attempts = max(
+            0, total_today - kpis["dedup_skips"] - kpis["protected_blocks"]
+        )
+        claude_successes = claude_attempts - errors_today
+        if claude_attempts > 0:
+            claude_success_rate = round(
+                claude_successes / claude_attempts * 100, 2
+            )
+        else:
+            claude_success_rate = None
+
+        health = {
+            "render_status": "online",
+            "db_path": DB_PATH,
+            "total_logged": total_logged_all_time,
+            "webhook_uptime_pct": webhook_uptime_pct,
+            "webhook_total_today": total_today,
+            "webhook_success_today": total_today - errors_today,
+            "dedup_blocks_today": kpis["dedup_skips"],
+            "protected_blocks_today": kpis["protected_blocks"],
+            "protected_numbers": [
+                normalize_wa(BUSINESS_NUMBER),
+                normalize_wa(OWNER_NUMBER),
+            ],
+            "avg_latency_ms": kpis["avg_latency_ms"],
+            "latency_p99_ms": latency_p99_ms,
+            "claude_attempts_today": claude_attempts,
+            "claude_successes_today": claude_successes,
+            "claude_success_rate": claude_success_rate,
+        }
+
         conn.close()
 
         return jsonify({
@@ -1019,6 +1121,7 @@ def dashboard_data():
             "daily_volume": daily_volume,
             "error_log": error_log,
             "bulk_spike": bulk_spike,
+            "health": health,
         })
 
     except Exception as e:
