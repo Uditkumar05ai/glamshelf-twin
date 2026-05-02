@@ -614,6 +614,12 @@ def healthz():
         "db": db_status,
         "total_logged": total_logged,
         "seen_ids_cached": len(_seen_ids),
+        # Normalized protected numbers — diagnostic so misconfigured env vars
+        # are obvious from the public health probe. Phone numbers, not secrets.
+        "protected_numbers": [
+            normalize_wa(BUSINESS_NUMBER),
+            normalize_wa(OWNER_NUMBER),
+        ],
     })
 
 
