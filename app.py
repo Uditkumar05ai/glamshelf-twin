@@ -11,12 +11,14 @@ Auth: ANTHROPIC_API_KEY environment variable.
   - Render: set it in the service's Environment dashboard
 """
 
+import base64
 import json
 import os
 import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -103,6 +105,16 @@ DASHBOARD_KEY = os.environ.get("DASHBOARD_KEY", "changeme")
 #     aren't lost when you flip on the persistent disk.
 _LEGACY_DB_PATH = os.path.join(tempfile.gettempdir(), "glamshelf_logs.db")
 DB_PATH = os.environ.get("DASHBOARD_DB_PATH", _LEGACY_DB_PATH)
+
+# GitHub backup config — when all three env vars are set, the SQLite DB
+# is restored from GitHub on cold start (if no local copy) and backed up
+# every BACKUP_INTERVAL_SECONDS thereafter, plus once at startup.
+# Use a private repo + a token scoped to repo (or "Contents: read/write"
+# on a fine-grained PAT). All three must be set; missing any → skip silently.
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # e.g. Uditkumar05ai/glamshelf-backup
+GITHUB_BACKUP_PATH = os.environ.get("GITHUB_BACKUP_PATH", "glamshelf_logs.db")
+BACKUP_INTERVAL_SECONDS = 60 * 60
 
 # Recent message-id dedup. Backed by a short-lived cache file in the OS
 # temp dir so the dedup set survives worker restarts within a single
@@ -329,7 +341,143 @@ def _load_conversation_history(wa_id: str) -> list[dict]:
         return []
 
 
+def _github_backup_configured() -> bool:
+    """All three env vars must be set for backup/restore to even attempt
+    network calls. Token and repo are mandatory; backup path has a default."""
+    return bool(GITHUB_TOKEN and GITHUB_REPO)
+
+
+def _github_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _github_contents_url() -> str:
+    # GITHUB_BACKUP_PATH is a path-within-repo (e.g. "glamshelf_logs.db").
+    return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_BACKUP_PATH}"
+
+
+def _restore_db_from_github() -> None:
+    """Pull the latest backup from GitHub if there's no local DB yet.
+
+    Order matters: this runs BEFORE _init_db() so a freshly-deployed
+    Render instance with no /tmp DB picks up the previous deploy's data.
+    If a local DB already exists (e.g. legacy /tmp file or persistent
+    disk re-mount), we skip — never clobber live data.
+    """
+    if os.path.exists(DB_PATH):
+        return  # Local copy already present; don't overwrite.
+    if not _github_backup_configured():
+        print("[RESTORE] Skipped: GITHUB_TOKEN or GITHUB_REPO not set")
+        return
+    try:
+        resp = requests.get(_github_contents_url(), headers=_github_headers(), timeout=30)
+        if resp.status_code == 404:
+            print("[RESTORE] No backup found, starting fresh")
+            return
+        if not resp.ok:
+            print(f"[RESTORE] Failed: HTTP {resp.status_code} {resp.text[:200]}")
+            return
+        payload = resp.json()
+        content_b64 = (payload.get("content") or "").replace("\n", "")
+        if not content_b64:
+            print("[RESTORE] Failed: response had no content field")
+            return
+        raw = base64.b64decode(content_b64)
+        parent = os.path.dirname(DB_PATH)
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent, exist_ok=True)
+        with open(DB_PATH, "wb") as f:
+            f.write(raw)
+        print(f"[RESTORE] DB restored from GitHub ({len(raw)} bytes)")
+    except Exception as e:
+        print(f"[RESTORE] Failed: {type(e).__name__}: {e}")
+
+
+def _backup_db_to_github() -> None:
+    """Push the current DB file to GitHub via the Contents API.
+
+    Idempotent — uses the existing file's SHA when present (required by
+    the API for updates). All exceptions are logged and swallowed; the
+    backup loop never crashes the app.
+    """
+    if not _github_backup_configured():
+        print("[BACKUP] Skipped: env vars not set")
+        return
+    if not os.path.exists(DB_PATH):
+        print(f"[BACKUP] Skipped: DB file not found at {DB_PATH}")
+        return
+    try:
+        with open(DB_PATH, "rb") as f:
+            raw = f.read()
+        content_b64 = base64.b64encode(raw).decode("ascii")
+
+        # Look up the existing file's SHA — required when updating an
+        # existing path. 404 (file doesn't exist yet) is the create case.
+        existing_sha: str | None = None
+        try:
+            head = requests.get(
+                _github_contents_url(), headers=_github_headers(), timeout=15
+            )
+            if head.ok:
+                existing_sha = head.json().get("sha")
+            elif head.status_code != 404:
+                print(
+                    f"[BACKUP] SHA lookup returned {head.status_code}: "
+                    f"{head.text[:200]} — proceeding as create"
+                )
+        except Exception as e:
+            print(f"[BACKUP] SHA lookup error ({type(e).__name__}: {e}) — proceeding as create")
+
+        payload = {
+            "message": f"auto-backup glamshelf_logs.db @ {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
+            "content": content_b64,
+        }
+        if existing_sha:
+            payload["sha"] = existing_sha
+
+        resp = requests.put(
+            _github_contents_url(), headers=_github_headers(), json=payload, timeout=60
+        )
+        if resp.ok:
+            print(f"[BACKUP] DB backed up to GitHub ({len(raw)} bytes)")
+        else:
+            print(f"[BACKUP] Failed: HTTP {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        print(f"[BACKUP] Failed: {type(e).__name__}: {e}")
+
+
+def _backup_loop_tick() -> None:
+    """Single tick: back up, then schedule the next tick. Always re-arms,
+    even when the backup itself raises, so a transient error doesn't kill
+    the loop."""
+    try:
+        _backup_db_to_github()
+    except Exception as e:
+        print(f"[BACKUP] Loop tick crashed: {type(e).__name__}: {e}")
+    finally:
+        t = threading.Timer(BACKUP_INTERVAL_SECONDS, _backup_loop_tick)
+        t.daemon = True
+        t.start()
+
+
+def _start_backup_loop() -> None:
+    """Kick off the periodic backup. Initial backup runs immediately in a
+    background thread so it can't block startup; subsequent ticks fire on
+    the timer cadence. All threads are daemons — they won't block process
+    shutdown when Render recycles the worker."""
+    if not _github_backup_configured():
+        print("[BACKUP] Skipped: env vars not set (loop disabled)")
+        return
+    threading.Thread(target=_backup_loop_tick, daemon=True).start()
+
+
+_restore_db_from_github()
 _init_db()
+_start_backup_loop()
 
 # Anthropic client picks up ANTHROPIC_API_KEY from the environment.
 client = Anthropic()
