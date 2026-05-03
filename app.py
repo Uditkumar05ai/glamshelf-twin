@@ -170,6 +170,14 @@ def _persist_seen_id(msg_id: str) -> None:
 _seen_ids: set[str] = _load_seen_ids()
 print(f"[DEDUP] Loaded {len(_seen_ids)} recent message ids from {DEDUP_CACHE_FILE}")
 
+# In-memory TTL cache for brain.md content. We were re-reading ~40KB off
+# disk on every webhook call — wasteful when the file changes maybe once
+# a day. Cache for 5 minutes; refresh transparently on the next request
+# after expiry. _brain_cache_text=None means "never loaded yet".
+BRAIN_CACHE_TTL_SECONDS = 300
+_brain_cache_text: str | None = None
+_brain_cache_loaded_at: float = 0.0
+
 
 def _init_db() -> None:
     """Create the message_logs table and supporting indexes if missing.
@@ -521,7 +529,7 @@ def draft_reply_logic(
     if not BRAIN_FILE.exists():
         raise FileNotFoundError(f"brain file not found at {BRAIN_FILE}")
 
-    brain = load_brain()
+    brain = _load_brain_cached()
     raw = ask_claude(brain, message, order_context, history=history)
 
     classification = ""
@@ -555,10 +563,50 @@ def login_required(view):
 
 
 def load_brain() -> str:
-    """Read brain.md fresh from disk on every request."""
+    """Read brain.md fresh from disk. Always hits the filesystem.
+
+    Most callers should go through _load_brain_cached() instead; this
+    function is the raw IO primitive and the inner read for the cache.
+    """
     print(f"[BRAIN] Loading {BRAIN_FILE}")
     text = BRAIN_FILE.read_text(encoding="utf-8")
     print(f"[BRAIN] Loaded {len(text)} chars")
+    return text
+
+
+def _load_brain_cached() -> str:
+    """Return the brain text, using a 5-minute in-memory TTL cache.
+
+    Cache states:
+      - fresh (age < TTL): log "[BRAIN] Cache hit" and return cached text
+      - empty or expired:  log "[BRAIN] Cache miss, reloading" and re-read
+
+    Failure handling: if disk read fails AND we have a previously cached
+    value, fall back to the cached value so a transient FS issue doesn't
+    take down the webhook. If there's no cached value, propagate the
+    error (same behavior as load_brain() before the cache existed).
+    """
+    global _brain_cache_text, _brain_cache_loaded_at
+
+    age = time.time() - _brain_cache_loaded_at
+    if _brain_cache_text is not None and age < BRAIN_CACHE_TTL_SECONDS:
+        print(f"[BRAIN] Cache hit (age {age:.0f}s, TTL {BRAIN_CACHE_TTL_SECONDS}s)")
+        return _brain_cache_text
+
+    print("[BRAIN] Cache miss, reloading")
+    try:
+        text = load_brain()
+    except Exception as e:
+        if _brain_cache_text is not None:
+            print(
+                f"[BRAIN] Reload failed ({type(e).__name__}: {e}); "
+                "serving last cached value"
+            )
+            return _brain_cache_text
+        raise
+
+    _brain_cache_text = text
+    _brain_cache_loaded_at = time.time()
     return text
 
 
