@@ -113,6 +113,12 @@ DB_PATH = os.environ.get("DASHBOARD_DB_PATH", _LEGACY_DB_PATH)
 # on a fine-grained PAT). All three must be set; missing any → skip silently.
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # e.g. Uditkumar05ai/glamshelf-backup
+# Tolerate someone pasting a full URL by mistake — strip the github.com
+# prefix and any trailing slash so "https://github.com/owner/repo" and
+# "owner/repo" both resolve to the canonical "owner/repo" form expected
+# by the GitHub Contents API. This is the exact mistake that caused the
+# earlier 404s during initial setup.
+GITHUB_REPO = GITHUB_REPO.replace("https://github.com/", "").rstrip("/")
 GITHUB_BACKUP_PATH = os.environ.get("GITHUB_BACKUP_PATH", "glamshelf_logs.db")
 BACKUP_INTERVAL_SECONDS = 60 * 60
 
