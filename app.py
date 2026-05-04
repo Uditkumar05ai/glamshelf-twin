@@ -404,7 +404,6 @@ def _backup_db_to_github() -> None:
     the API for updates). All exceptions are logged and swallowed; the
     backup loop never crashes the app.
     """
-    print(f"[BACKUP DEBUG] token={GITHUB_TOKEN[:8] if GITHUB_TOKEN else 'EMPTY'} repo={GITHUB_REPO} path={GITHUB_BACKUP_PATH}")
     if not _github_backup_configured():
         print("[BACKUP] Skipped: env vars not set")
         return
