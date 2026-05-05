@@ -130,6 +130,17 @@ BACKUP_INTERVAL_SECONDS = 60 * 60
 # the safe default until the secret is set.
 SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
 
+# Instagram DM webhook config.
+#   - INSTAGRAM_VERIFY_TOKEN: any string you choose. Meta sends it back
+#     in the GET handshake; we compare and respond with hub.challenge.
+#   - INSTAGRAM_PAGE_ACCESS_TOKEN: long-lived Page access token from your
+#     Meta app, used to send replies via the Graph API.
+# Both missing → GET handshake always 403; POST processes locally but
+# can't send replies.
+INSTAGRAM_VERIFY_TOKEN = os.environ.get("INSTAGRAM_VERIFY_TOKEN", "")
+INSTAGRAM_PAGE_ACCESS_TOKEN = os.environ.get("INSTAGRAM_PAGE_ACCESS_TOKEN", "")
+INSTAGRAM_TIMEOUT_SECONDS = 10
+
 # Recent message-id dedup. Backed by a short-lived cache file in the OS
 # temp dir so the dedup set survives worker restarts within a single
 # deploy — without this, every Render worker recycle re-opens the
@@ -285,6 +296,23 @@ def _init_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_phone ON orders(customer_phone)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_logged ON orders(logged_at)")
+
+        # Instagram DM exchange log — separate table from message_logs so
+        # WhatsApp dashboard counts stay clean and channel-specific.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS instagram_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_id TEXT,
+                message_text TEXT,
+                reply_text TEXT,
+                timestamp TEXT,
+                logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ig_sender ON instagram_logs(sender_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ig_logged ON instagram_logs(logged_at)")
 
         conn.commit()
         conn.close()
@@ -499,6 +527,116 @@ def _lookup_recent_order(wa_id: str) -> str:
     except Exception as e:
         print(f"[ORDER] Lookup failed for {wa_id}: {type(e).__name__}: {e}")
         return ""
+
+
+def _send_instagram_reply(sender_id: str, text: str) -> None:
+    """Send an outbound Instagram DM via the Meta Graph Messages API.
+
+    Endpoint: POST https://graph.facebook.com/v19.0/me/messages
+    Auth via ?access_token=... query param (Meta's documented pattern).
+    Body: {"recipient": {"id": <sender>}, "message": {"text": <reply>}}
+
+    All exceptions are logged-and-swallowed — Instagram delivery must
+    never break the webhook 200 response. Missing access token →
+    skipped silently with a single log line.
+    """
+    if not INSTAGRAM_PAGE_ACCESS_TOKEN:
+        print("[INSTAGRAM] Skipped: INSTAGRAM_PAGE_ACCESS_TOKEN not set")
+        return
+    if not sender_id or not text:
+        return
+
+    url = "https://graph.facebook.com/v19.0/me/messages"
+    params = {"access_token": INSTAGRAM_PAGE_ACCESS_TOKEN}
+    payload = {
+        "recipient": {"id": sender_id},
+        "message": {"text": text},
+    }
+
+    try:
+        resp = requests.post(
+            url, params=params, json=payload, timeout=INSTAGRAM_TIMEOUT_SECONDS
+        )
+        if resp.ok:
+            print(f"[INSTAGRAM] Sent reply to {sender_id} ({len(text)} chars)")
+        else:
+            print(
+                f"[INSTAGRAM] Failed: HTTP {resp.status_code} "
+                f"{resp.text[:300]}"
+            )
+    except requests.RequestException as e:
+        print(f"[INSTAGRAM] Network error: {type(e).__name__}: {e}")
+    except Exception as e:
+        print(f"[INSTAGRAM] Unexpected error: {type(e).__name__}: {e}")
+
+
+def _log_instagram(
+    sender_id: str,
+    message_text: str,
+    reply_text: str,
+    timestamp: str,
+) -> None:
+    """Insert one Instagram exchange into instagram_logs.
+
+    Failures swallowed — same pattern as _log_message and
+    _log_shopify_order. Backup loop captures this table at the next
+    tick like every other table on the same SQLite file.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO instagram_logs "
+            "(sender_id, message_text, reply_text, timestamp) "
+            "VALUES (?, ?, ?, ?)",
+            (sender_id, message_text, reply_text, timestamp),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[DB] _log_instagram failed: {type(e).__name__}: {e}")
+
+
+def _load_instagram_history(sender_id: str) -> list[dict]:
+    """Pull up to 10 recent (DM, reply) exchanges with this Instagram
+    sender from the last 24 hours, oldest first.
+
+    Returns the same shape as _load_conversation_history so it can be
+    handed straight to ask_claude(history=...) — list of dicts with
+    msg_text / reply_text / ts. ts is a placeholder (0) here since we
+    don't need it for the prompt construction.
+
+    Failures return [] silently so the call falls back to single-turn
+    behavior, identical to a brand-new sender.
+    """
+    if not sender_id:
+        return []
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT message_text, reply_text
+            FROM instagram_logs
+            WHERE sender_id = ?
+              AND message_text IS NOT NULL
+              AND reply_text IS NOT NULL
+              AND logged_at >= datetime('now', '-1 day')
+            ORDER BY logged_at DESC
+            LIMIT 10
+            """,
+            (sender_id,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        rows.reverse()  # oldest first
+        history = [
+            {"ts": 0, "msg_text": r[0], "reply_text": r[1]} for r in rows
+        ]
+        print(f"[INSTAGRAM] Loaded {len(history)} history turns for {sender_id}")
+        return history
+    except Exception as e:
+        print(f"[INSTAGRAM] History load failed for {sender_id}: {type(e).__name__}: {e}")
+        return []
 
 
 def _github_backup_configured() -> bool:
@@ -816,6 +954,7 @@ def draft_reply_logic(
     message: str,
     order_context: str = "",
     history: list[dict] | None = None,
+    source: str = "WhatsApp",
 ) -> tuple[str, str, str]:
     """Core twin pipeline — load brain, call Claude, parse classification.
 
@@ -824,12 +963,14 @@ def draft_reply_logic(
       - reply: drafted message text, or "" if parse failed
       - raw_response: exactly what Claude returned (after fence stripping)
 
-    Used by both /api/draft (which returns raw_response to the browser)
-    and /webhook (which dispatches based on classification).
+    Used by /api/draft (browser drafter), /webhook (WATI WhatsApp), and
+    /instagram-webhook (Meta DM). Each caller passes whatever extras
+    apply: history for ongoing conversations, source for the channel
+    label, order_context for Shopify recent-order injection.
 
-    Optional `history` (oldest → newest) gives Claude per-customer context;
-    only the webhook caller passes it — /api/draft has no wa_id and never
-    will, so it stays single-turn.
+    `source` defaults to "WhatsApp" so /api/draft and the WATI webhook
+    are byte-identical to the previous behavior; the Instagram webhook
+    passes source="Instagram DM".
 
     Raises if brain.md is missing or the Claude API call fails — callers
     must catch and decide how to surface the error.
@@ -838,7 +979,7 @@ def draft_reply_logic(
         raise FileNotFoundError(f"brain file not found at {BRAIN_FILE}")
 
     brain = _load_brain_cached()
-    raw = ask_claude(brain, message, order_context, history=history)
+    raw = ask_claude(brain, message, order_context, history=history, source=source)
 
     classification = ""
     reply = ""
@@ -918,11 +1059,20 @@ def _load_brain_cached() -> str:
     return text
 
 
-def build_user_message(customer_message: str, order_context: str) -> str:
+def build_user_message(
+    customer_message: str,
+    order_context: str,
+    source: str = "WhatsApp",
+) -> str:
     """The per-request user prompt. The brain itself goes in the `system`
-    parameter (with cache_control) — see ask_claude()."""
+    parameter (with cache_control) — see ask_claude().
+
+    `source` labels the channel in the prompt header so Claude knows
+    where the message came from. Default "WhatsApp" keeps every existing
+    caller (/api/draft, WATI /webhook) byte-identical to the previous
+    behavior. Instagram callers pass "Instagram DM"."""
     return (
-        "Customer WhatsApp message:\n"
+        f"Customer {source} message:\n"
         f"{customer_message}\n\n"
         "Order context (may be empty):\n"
         f"{order_context or '(none provided)'}\n\n"
@@ -962,6 +1112,7 @@ def ask_claude(
     customer_message: str,
     order_context: str,
     history: list[dict] | None = None,
+    source: str = "WhatsApp",
 ) -> str:
     """Call the Anthropic Messages API.
 
@@ -976,12 +1127,16 @@ def ask_claude(
     Each entry becomes a user/assistant pair preceding the current
     user message, so Claude treats the request as a real multi-turn
     conversation rather than a one-shot question.
+
+    `source` labels the channel ("WhatsApp" by default, "Instagram DM"
+    for IG webhook calls). Surfaced in the per-request user prompt
+    header; doesn't affect the cached system prompt.
     """
-    user_text = build_user_message(customer_message, order_context)
+    user_text = build_user_message(customer_message, order_context, source=source)
     print(
         f"[CLAUDE] Calling {MODEL} "
         f"(brain: {len(brain)} chars, user: {len(user_text)} chars, "
-        f"history: {len(history) if history else 0} turns)"
+        f"history: {len(history) if history else 0} turns, source: {source})"
     )
 
     # Build the messages list. When history is non-empty, prior exchanges
@@ -1065,10 +1220,12 @@ def healthz():
     db_status = "ok"
     total_logged = 0
     total_orders = 0
+    total_instagram = 0
     try:
         conn = sqlite3.connect(DB_PATH)
         total_logged = conn.execute("SELECT COUNT(*) FROM message_logs").fetchone()[0]
         total_orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        total_instagram = conn.execute("SELECT COUNT(*) FROM instagram_logs").fetchone()[0]
         conn.close()
     except Exception as e:
         db_status = f"error: {type(e).__name__}: {e}"
@@ -1082,6 +1239,7 @@ def healthz():
         "db": db_status,
         "total_logged": total_logged,
         "total_orders": total_orders,
+        "total_instagram": total_instagram,
         "seen_ids_cached": len(_seen_ids),
         # Normalized protected numbers — diagnostic so misconfigured env vars
         # are obvious from the public health probe. Phone numbers, not secrets.
@@ -1383,6 +1541,119 @@ def shopify_webhook():
         return jsonify({"status": "ok"}), 200
 
 
+@app.route("/instagram-webhook", methods=["GET"])
+def instagram_webhook_verify():
+    """Meta's webhook verification handshake.
+
+    On webhook setup, Meta sends a GET with hub.mode=subscribe,
+    hub.verify_token=<your token>, hub.challenge=<random string>.
+    We must echo hub.challenge back as plain text 200 only when the
+    token matches. Otherwise 403.
+    """
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge") or ""
+
+    if (
+        mode == "subscribe"
+        and INSTAGRAM_VERIFY_TOKEN
+        and token == INSTAGRAM_VERIFY_TOKEN
+    ):
+        print("[INSTAGRAM] Webhook verification accepted")
+        return challenge, 200
+    print(f"[INSTAGRAM] Webhook verification refused (mode={mode!r})")
+    return "forbidden", 403
+
+
+@app.route("/instagram-webhook", methods=["POST"])
+def instagram_webhook():
+    """Receive Instagram DM webhook events from Meta.
+
+    Always returns 200 — Meta retries on non-2xx, which would create
+    duplicate replies. Echoes (messages we sent) and non-text events
+    are silently ignored. Each text DM runs through the full twin
+    pipeline (history → brain → Claude) and the reply ships back via
+    the Graph API.
+    """
+    print("\n" + "=" * 60)
+    try:
+        data = request.get_json(silent=True) or {}
+        for entry in data.get("entry", []) or []:
+            for event in entry.get("messaging", []) or []:
+                _process_instagram_event(event)
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        print(f"[INSTAGRAM] EXCEPTION: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return jsonify({"status": "ok"}), 200
+
+
+def _process_instagram_event(event: dict) -> None:
+    """Handle a single messaging event. Failures are absorbed into log
+    lines so one bad event can't take down the rest of the batch."""
+    try:
+        sender_id = ((event.get("sender") or {}).get("id") or "").strip()
+        message = event.get("message") or {}
+
+        # Echoes are messages WE sent (Meta loops them back). Skip silently.
+        if message.get("is_echo"):
+            return
+
+        text = (message.get("text") or "").strip()
+        if not text:
+            # Non-text event (image, sticker, reaction, etc.) — silent skip.
+            return
+
+        if not sender_id:
+            print("[INSTAGRAM] Skipped: missing sender.id")
+            return
+
+        msg_id = (message.get("mid") or "").strip()
+        timestamp = str(event.get("timestamp") or "")
+
+        print(f"[INSTAGRAM] DM from {sender_id}: {text[:200]}")
+
+        # Reuse the same dedup set the WATI webhook uses — sender ID + mid
+        # collisions across channels would be astronomically improbable.
+        if msg_id and msg_id in _seen_ids:
+            print(f"[INSTAGRAM] Skipped: duplicate mid {msg_id}")
+            return
+        if msg_id:
+            _seen_ids.add(msg_id)
+            _persist_seen_id(msg_id)
+
+        # Best-effort order context. Sender IDs are 17-digit FB IDs and
+        # won't match Indian phone numbers in the orders table — function
+        # returns "" for the no-match case, which is fine.
+        order_line = _lookup_recent_order(sender_id)
+
+        # Multi-turn context, IG-side only.
+        history = _load_instagram_history(sender_id)
+
+        try:
+            classification, reply, _raw = draft_reply_logic(
+                text, order_line, history=history, source="Instagram DM"
+            )
+        except Exception as e:
+            print(f"[INSTAGRAM] Twin pipeline failed: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            return
+
+        if not reply:
+            print(
+                f"[INSTAGRAM] Twin returned empty reply "
+                f"(classification={classification!r}); not sending"
+            )
+            return
+
+        _send_instagram_reply(sender_id, reply)
+        _log_instagram(sender_id, text, reply, timestamp)
+        print(f"[INSTAGRAM] Logged DM exchange for {sender_id} ({classification})")
+    except Exception as e:
+        print(f"[INSTAGRAM] Event handler error: {type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
 @app.route("/dashboard-data", methods=["GET"])
 def dashboard_data():
     """JSON snapshot of message logs for the founder's live dashboard.
@@ -1581,6 +1852,9 @@ def dashboard_data():
         cur.execute("SELECT COUNT(*) FROM orders")
         total_orders_all_time = cur.fetchone()[0] or 0
 
+        cur.execute("SELECT COUNT(*) FROM instagram_logs")
+        total_instagram_all_time = cur.fetchone()[0] or 0
+
         # Webhook uptime — fraction of today's events that didn't ERROR.
         total_today = kpis["total"]
         errors_today = kpis["errors"]
@@ -1611,6 +1885,7 @@ def dashboard_data():
             "db_path": DB_PATH,
             "total_logged": total_logged_all_time,
             "total_orders": total_orders_all_time,
+            "total_instagram": total_instagram_all_time,
             "webhook_uptime_pct": webhook_uptime_pct,
             "webhook_total_today": total_today,
             "webhook_success_today": total_today - errors_today,
