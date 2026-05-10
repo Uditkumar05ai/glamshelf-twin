@@ -161,6 +161,17 @@ def _clean_meta_token(raw: str) -> str:
 INSTAGRAM_PAGE_ACCESS_TOKEN = _clean_meta_token(
     os.environ.get("INSTAGRAM_PAGE_ACCESS_TOKEN", "")
 )
+
+# Instagram-connected Page ID. With newer Page Access Tokens issued via
+# Instagram Login flows, the `me` alias on the Graph API doesn't reliably
+# resolve to the IG-connected Page for the /messages endpoint — Meta
+# returns "Unsupported post request. Object with ID 'me' does not exist".
+# Setting INSTAGRAM_PAGE_ID to the explicit Instagram Business Account ID
+# (e.g. 17841479591075688 — visible in Meta Business Suite under your
+# Instagram account → Account info) forces the URL to the right resource.
+# Empty / unset → falls back to "me", preserving prior behavior for any
+# environment where that still works.
+INSTAGRAM_PAGE_ID = os.environ.get("INSTAGRAM_PAGE_ID", "").strip()
 INSTAGRAM_TIMEOUT_SECONDS = 10
 
 # Recent message-id dedup. Backed by a short-lived cache file in the OS
@@ -568,7 +579,11 @@ def _send_instagram_reply(sender_id: str, text: str) -> None:
     if not sender_id or not text:
         return
 
-    url = "https://graph.facebook.com/v19.0/me/messages"
+    # INSTAGRAM_PAGE_ID resolves to a real Instagram Business Account ID
+    # when set (preferred for newer tokens) or "me" as a fallback for the
+    # older Page Token flow where /me/messages still works.
+    page_ref = INSTAGRAM_PAGE_ID or "me"
+    url = f"https://graph.facebook.com/v19.0/{page_ref}/messages"
     params = {"access_token": INSTAGRAM_PAGE_ACCESS_TOKEN}
     payload = {
         "recipient": {"id": sender_id},
