@@ -856,6 +856,7 @@ def send_telegram_notification(
     customer_message: str,
     reply: str,
     sender_info: str | None = None,
+    channel: str = "WhatsApp",
 ) -> None:
     """Fire a Telegram message to the founder for DRAFT+APPROVE and ESCALATE.
 
@@ -863,8 +864,16 @@ def send_telegram_notification(
     Udit doesn't need to be paged about it).
 
     sender_info is optional — when present (e.g. when called from the WATI
-    webhook), it's prepended to the message so Udit knows which WhatsApp
-    contact to reply to.
+    or Instagram webhook), it's prepended to the message so Udit knows
+    which contact to reply to.
+
+    `channel` (default "WhatsApp") tunes the action-footer phrasing per
+    channel: WhatsApp says "from your WhatsApp Business app" and ESCALATE
+    instructs to NOT send (because the WATI handler suppresses the reply
+    on ESCALATE/DRAFT). Instagram says "from your Instagram DMs" and
+    ESCALATE notes the holding reply was already sent (because the IG
+    handler ships every classification's reply). Default preserves the
+    existing WATI behavior byte-for-byte.
 
     All failures (network, Telegram API errors, missing token, etc.) are
     logged and swallowed — Telegram is a side effect, never a blocker for
@@ -875,6 +884,19 @@ def send_telegram_notification(
 
     sender_block = f"From: {sender_info}\n\n" if sender_info else ""
 
+    # Channel-specific phrasing for the action footer. WhatsApp branch is
+    # the verbatim original wording; Instagram branch reflects that the
+    # IG handler already shipped the customer reply.
+    if channel == "Instagram":
+        approve_destination = "your Instagram DMs"
+        escalate_action = (
+            "→ Holding reply already sent on Instagram. "
+            "Take over the conversation directly."
+        )
+    else:
+        approve_destination = "your WhatsApp Business app"
+        escalate_action = "→ Do NOT send the reply. Handle this yourself."
+
     if classification == "DRAFT+APPROVE":
         text = (
             "🟡 DRAFT + APPROVE\n\n"
@@ -883,7 +905,7 @@ def send_telegram_notification(
             f'"{customer_message}"\n\n'
             "Drafted reply:\n"
             f'"{reply}"\n\n'
-            "→ Review and send manually from your WhatsApp Business app."
+            f"→ Review and send manually from {approve_destination}."
         )
     elif classification == "ESCALATE":
         text = (
@@ -893,7 +915,7 @@ def send_telegram_notification(
             f'"{customer_message}"\n\n'
             "Suggested holding reply:\n"
             f'"{reply}"\n\n'
-            "→ Do NOT send the reply. Handle this yourself."
+            f"{escalate_action}"
         )
     else:
         # Unknown / malformed classification — don't spam Telegram.
@@ -1719,6 +1741,31 @@ def _process_instagram_event(event: dict) -> None:
         _send_instagram_reply(sender_id, reply)
         _log_instagram(sender_id, text, reply, timestamp)
         print(f"[INSTAGRAM] Logged DM exchange for {sender_id} ({classification})")
+
+        # Page the founder on Telegram for non-AUTO classifications,
+        # mirroring the WATI webhook. AUTO sends nothing (the bot's
+        # reply is safe to ship as-is and doesn't warrant a ping). The
+        # IG channel is passed explicitly so the action footer reflects
+        # Instagram-specific guidance (e.g. "holding reply already sent").
+        # Wrapped in its own try so a Telegram outage doesn't take down
+        # the IG flow.
+        if classification in ("DRAFT+APPROVE", "ESCALATE"):
+            try:
+                ig_sender_info = f"Instagram DM — sender {sender_id}"
+                send_telegram_notification(
+                    classification,
+                    text,
+                    reply,
+                    sender_info=ig_sender_info,
+                    channel="Instagram",
+                )
+                tag = "DRAFT" if classification == "DRAFT+APPROVE" else "ESCALATE"
+                print(f"[INSTAGRAM-{tag}] Notified founder for {sender_id}")
+            except Exception as tg_err:
+                print(
+                    f"[INSTAGRAM-TG] Notification failed: "
+                    f"{type(tg_err).__name__}: {tg_err}"
+                )
     except Exception as e:
         print(f"[INSTAGRAM] Event handler error: {type(e).__name__}: {e}")
         traceback.print_exc()
