@@ -1742,6 +1742,21 @@ def _process_instagram_event(event: dict) -> None:
         _log_instagram(sender_id, text, reply, timestamp)
         print(f"[INSTAGRAM] Logged DM exchange for {sender_id} ({classification})")
 
+        # ===== TEMP DEBUG — remove once IG Telegram path is confirmed working =====
+        # Logs the exact classification value (repr exposes whitespace / casing /
+        # unicode quirks the regular log line would hide) AND whether the
+        # membership test the dispatch branch depends on will return True.
+        # Two prints because we need to distinguish three failure modes:
+        #   - membership test returns False (then no entered-branch line)
+        #   - branch entered but send_telegram_notification silent (no [TG] line)
+        #   - branch entered AND function called (a [TG] line appears below)
+        should_notify = classification in ("DRAFT+APPROVE", "ESCALATE")
+        print(
+            f"[INSTAGRAM-DEBUG] before-dispatch: "
+            f"classification={classification!r} should_notify={should_notify}"
+        )
+        # ===== END TEMP DEBUG =====
+
         # Page the founder on Telegram for non-AUTO classifications,
         # mirroring the WATI webhook. AUTO sends nothing (the bot's
         # reply is safe to ship as-is and doesn't warrant a ping). The
@@ -1750,6 +1765,7 @@ def _process_instagram_event(event: dict) -> None:
         # Wrapped in its own try so a Telegram outage doesn't take down
         # the IG flow.
         if classification in ("DRAFT+APPROVE", "ESCALATE"):
+            print(f"[INSTAGRAM-DEBUG] entered dispatch branch for {classification!r}")
             try:
                 ig_sender_info = f"Instagram DM — sender {sender_id}"
                 send_telegram_notification(
