@@ -131,12 +131,30 @@ BACKUP_INTERVAL_SECONDS = 60 * 60
 SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
 
 # Instagram DM webhook config.
-#   - INSTAGRAM_VERIFY_TOKEN: any string you choose. Meta sends it back
-#     in the GET handshake; we compare and respond with hub.challenge.
-#   - INSTAGRAM_PAGE_ACCESS_TOKEN: long-lived Page access token from your
-#     Meta app, used to send replies via the Graph API.
-# Both missing → GET handshake always 403; POST processes locally but
-# can't send replies.
+#
+# IMPORTANT — there are TWO Instagram messaging APIs and they need
+# different tokens. Glam Shelf Twin uses the newer "Instagram Login"
+# flow (graph.instagram.com), NOT the older Messenger Platform
+# (graph.facebook.com). Generating the wrong token type produces
+# "Object 'me' does not exist" or "missing permissions" errors that
+# are unrelated to the actual access — the host simply doesn't
+# recognise the token holder.
+#
+# Token generation path (Meta Developer Console):
+#   App → Use cases → Instagram → Generate access tokens (Section 2)
+#   Required permission: instagram_business_manage_messages
+#   Token format: starts with IGAA... or sometimes EAAx... (NOT plain EAA/EAAS)
+#
+# Env vars:
+#   INSTAGRAM_VERIFY_TOKEN          arbitrary string for hub.challenge handshake
+#   INSTAGRAM_PAGE_ACCESS_TOKEN     long-lived IG user token (see above)
+#   INSTAGRAM_PAGE_ID               IG Business Account ID (e.g. 17841479591075688)
+#   INSTAGRAM_API_BASE              optional override; default targets the IG
+#                                   Login API. Set to https://graph.facebook.com/v22.0
+#                                   only if migrating back to the Messenger
+#                                   Platform with a Page Access Token.
+# Missing required vars → GET handshake always 403; POST processes locally
+# but can't send replies.
 INSTAGRAM_VERIFY_TOKEN = os.environ.get("INSTAGRAM_VERIFY_TOKEN", "")
 
 
@@ -162,16 +180,20 @@ INSTAGRAM_PAGE_ACCESS_TOKEN = _clean_meta_token(
     os.environ.get("INSTAGRAM_PAGE_ACCESS_TOKEN", "")
 )
 
-# Instagram-connected Page ID. With newer Page Access Tokens issued via
-# Instagram Login flows, the `me` alias on the Graph API doesn't reliably
-# resolve to the IG-connected Page for the /messages endpoint — Meta
-# returns "Unsupported post request. Object with ID 'me' does not exist".
-# Setting INSTAGRAM_PAGE_ID to the explicit Instagram Business Account ID
-# (e.g. 17841479591075688 — visible in Meta Business Suite under your
-# Instagram account → Account info) forces the URL to the right resource.
-# Empty / unset → falls back to "me", preserving prior behavior for any
-# environment where that still works.
+# Instagram-connected Account ID. Visible in Meta Business Suite under
+# the Instagram account → Account info, or by hitting the /me endpoint
+# with the IG Login token. Used as the explicit subject in the messages
+# URL — required because the `me` alias is unreliable across IG flows.
+# Empty / unset → falls back to "me", which works for some token flavors.
 INSTAGRAM_PAGE_ID = os.environ.get("INSTAGRAM_PAGE_ID", "").strip()
+
+# API base URL. Default targets the Instagram Graph API (Instagram Login
+# flow) which is where instagram_business_manage_messages tokens have
+# scope. Override only if migrating back to the Messenger Platform.
+INSTAGRAM_API_BASE = os.environ.get(
+    "INSTAGRAM_API_BASE", "https://graph.instagram.com/v22.0"
+).rstrip("/")
+
 INSTAGRAM_TIMEOUT_SECONDS = 10
 
 # Recent message-id dedup. Backed by a short-lived cache file in the OS
@@ -579,11 +601,15 @@ def _send_instagram_reply(sender_id: str, text: str) -> None:
     if not sender_id or not text:
         return
 
-    # INSTAGRAM_PAGE_ID resolves to a real Instagram Business Account ID
-    # when set (preferred for newer tokens) or "me" as a fallback for the
-    # older Page Token flow where /me/messages still works.
+    # INSTAGRAM_PAGE_ID resolves to the Instagram Business Account ID when
+    # set, else "me" as a fallback. INSTAGRAM_API_BASE defaults to the
+    # Instagram Graph API (graph.instagram.com) — the host where IG Login
+    # tokens with instagram_business_manage_messages have scope. Hitting
+    # graph.facebook.com with an IG-flow token produces the misleading
+    # "Object with ID 'me' does not exist due to missing permissions"
+    # error: it's not a permissions issue, it's the wrong host.
     page_ref = INSTAGRAM_PAGE_ID or "me"
-    url = f"https://graph.facebook.com/v19.0/{page_ref}/messages"
+    url = f"{INSTAGRAM_API_BASE}/{page_ref}/messages"
     params = {"access_token": INSTAGRAM_PAGE_ACCESS_TOKEN}
     payload = {
         "recipient": {"id": sender_id},
