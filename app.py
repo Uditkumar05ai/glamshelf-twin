@@ -281,6 +281,22 @@ _brain_cache_loaded_at: float = 0.0
 PAUSED_TTL_SECONDS = 4 * 60 * 60  # 4 hours
 paused_numbers: dict[str, float] = {}  # wa_id -> expiry unix timestamp
 
+# Bot's-own-outbound recognition. When send_whatsapp_reply() ships a reply,
+# we register the text (and ideally the WATI-assigned msg_id) here so the
+# subsequent WATI outbound webhook for THAT message is correctly attributed
+# to the bot, not to Udit. Without this, the outbound handler would tag
+# every bot reply as "HUMAN_UDIT" → the safety net would then suppress all
+# AUTO replies for 4h after every bot reply, breaking the whole flow.
+# In-memory, short TTL — WATI's outbound webhook typically fires within a
+# couple of seconds of the send call. 5 minutes is generous.
+BOT_OUTBOUND_DEDUP_TTL_SECONDS = 5 * 60
+_bot_recent_replies: dict[str, float] = {}  # reply text -> expiry unix timestamp
+
+# DB safety-net check window — if a HUMAN_UDIT row exists in the last
+# HUMAN_HANDLING_WINDOW_SECONDS, the inbound flow suppresses Claude.
+# Matches the brain's Section 7 "4+ hours of silence to resume" rule.
+HUMAN_HANDLING_WINDOW_SECONDS = 4 * 60 * 60
+
 
 def _is_paused(wa_id: str) -> bool:
     """Return True if this number is currently in a human-takeover window.
@@ -292,6 +308,185 @@ def _is_paused(wa_id: str) -> bool:
         del paused_numbers[num]
         print(f"[PAUSE] Auto-expired for {num} (4h elapsed)")
     return wa_id in paused_numbers
+
+
+def _record_bot_outbound(reply_text: str, wati_response_data: dict | None = None) -> None:
+    """Register a bot-sent reply so the subsequent WATI outbound webhook
+    event for the same message is identified as bot-originated (not Udit's).
+
+    Two tracking signals:
+      - text content (always): added to _bot_recent_replies with a TTL.
+        When the outbound webhook arrives, we check whether the inbound
+        text matches a recently-sent reply.
+      - msg id (when WATI's API response gives us one): added to _seen_ids
+        proactively so the existing dedup gate catches the echo cleanly.
+
+    Different WATI plans return the msg-id under different keys; we try
+    the common ones and degrade gracefully if none are present.
+    """
+    if reply_text:
+        # Prune expired entries opportunistically.
+        now = time.time()
+        for old_text in list(_bot_recent_replies):
+            if _bot_recent_replies[old_text] < now:
+                del _bot_recent_replies[old_text]
+        _bot_recent_replies[reply_text] = now + BOT_OUTBOUND_DEDUP_TTL_SECONDS
+
+    if isinstance(wati_response_data, dict):
+        # Try several known key paths for the outbound msg id.
+        candidates = []
+        for k in ("id", "messageId", "message_id", "mid"):
+            v = wati_response_data.get(k)
+            if isinstance(v, str) and v:
+                candidates.append(v)
+        nested = wati_response_data.get("message") or wati_response_data.get("messageContact") or {}
+        if isinstance(nested, dict):
+            for k in ("id", "messageId", "mid"):
+                v = nested.get(k)
+                if isinstance(v, str) and v:
+                    candidates.append(v)
+        for mid in candidates:
+            _seen_ids.add(mid)
+            _persist_seen_id(mid)
+            print(f"[WATI] Pre-registered bot's outbound msg_id={mid} in dedup set")
+            break  # one msg id is enough; if there were several, they'd refer to the same send
+
+
+def _is_bot_outbound(text_body: str) -> bool:
+    """Was this exact text shipped by the bot in the last few minutes?"""
+    if not text_body or text_body not in _bot_recent_replies:
+        return False
+    if _bot_recent_replies[text_body] < time.time():
+        # Expired; clean up while we're here.
+        del _bot_recent_replies[text_body]
+        return False
+    return True
+
+
+def _is_outbound_event(data: dict) -> bool:
+    """Best-effort detection that a WATI webhook event is an OUTBOUND message
+    (sent FROM the business TO a customer), not an inbound customer message.
+
+    WATI's payload schema varies across plans/accounts. We check every known
+    direction-indicator field; if any clearly says outbound, we treat it as
+    such. Returns False (= treat as inbound) when no signal is present —
+    safer to leave existing inbound handling intact than to silently swallow
+    a customer message.
+
+    Callers also have the option of using the dedicated /wati-outbound
+    endpoint, which treats every event as outbound regardless of payload
+    shape — useful when WATI is configured to send outbound events to a
+    separate URL.
+    """
+    if not isinstance(data, dict):
+        return False
+    # Boolean flags — any one being truthy strongly implies outbound.
+    if data.get("owner") is True:
+        return True
+    if data.get("isOwner") is True:
+        return True
+    if data.get("fromMe") is True:
+        return True
+    # String-valued event/direction fields.
+    event_type = (data.get("eventType") or "").strip().lower()
+    if event_type in ("messagesent", "message_sent", "messagecreated", "message_created", "sent", "outbound"):
+        return True
+    direction = (data.get("direction") or "").strip().lower()
+    if direction in ("outbound", "out", "sent", "outgoing"):
+        return True
+    return False
+
+
+def _udit_replied_recently(wa_id: str, window_seconds: int = HUMAN_HANDLING_WINDOW_SECONDS) -> bool:
+    """Return True if a HUMAN_UDIT row exists for this wa_id within window_seconds.
+
+    Safety-net check that runs in the inbound flow BEFORE the Claude call.
+    Mirrors brain.md Section 7 "Human Takeover Protocol": when Udit has
+    replied manually in the recent past, the twin stays silent. Catches
+    the case where Udit forgets to type the in-memory #pause directive.
+
+    All failures return False (don't block inbound on a DB hiccup).
+    """
+    if not wa_id:
+        return False
+    try:
+        cutoff = time.time() - window_seconds
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM message_logs "
+            "WHERE wa_id = ? AND status = 'HUMAN_UDIT' AND ts >= ? "
+            "LIMIT 1",
+            (wa_id, cutoff),
+        )
+        hit = cur.fetchone() is not None
+        conn.close()
+        return hit
+    except Exception as e:
+        print(f"[HUMAN_HANDLING] Safety-net DB check failed: {type(e).__name__}: {e}")
+        return False
+
+
+def _process_wati_outbound(data: dict) -> None:
+    """Handle a single WATI outbound event — Udit's manual reply OR the
+    bot's own send echoing back. Distinguishes via _is_bot_outbound and
+    only logs Udit's manual replies as HUMAN_UDIT.
+
+    Used by both the dedicated /wati-outbound endpoint and the outbound
+    branch inside /webhook.
+    """
+    wa_id = (data.get("waId") or "").strip()
+    sender_name = (data.get("senderName") or "").strip()
+    text_field = data.get("text")
+    if isinstance(text_field, dict):
+        text_body = (text_field.get("body") or "").strip()
+    else:
+        text_body = (text_field or "").strip()
+    msg_id = (data.get("id") or "").strip()
+
+    if not wa_id or not text_body:
+        print(f"[OUTBOUND] Skipped: missing wa_id or empty text "
+              f"(wa_id={wa_id!r}, len(text)={len(text_body)})")
+        return
+
+    # If this exact text was sent by the bot recently → echo, not Udit's
+    # message. Skip silently. Also pre-mark msg_id in dedup so other code
+    # paths (e.g. accidental delivery to /webhook) treat it as a known
+    # echo.
+    if _is_bot_outbound(text_body):
+        print(f"[OUTBOUND] Skipped: bot's own outbound echo for {wa_id}")
+        if msg_id:
+            _seen_ids.add(msg_id)
+            _persist_seen_id(msg_id)
+        return
+
+    # #pause / #resume directives ride along on outbound messages too.
+    # Tag those as PAUSE_DIRECTIVE so the conversation-history view stays
+    # clean; the actual pause state is in the in-memory paused_numbers dict.
+    directive = _handle_pause_directive(wa_id, text_body)
+    if directive is not None:
+        _log_message(
+            wa_id, sender_name, text_body,
+            status="PAUSE_DIRECTIVE",
+            reply_text=text_body,
+        )
+        if msg_id:
+            _seen_ids.add(msg_id)
+            _persist_seen_id(msg_id)
+        return
+
+    # Plain Udit-manual-reply path. Log as HUMAN_UDIT so the safety-net
+    # check (_udit_replied_recently) on the next inbound suppresses the
+    # twin's auto-reply for 4h.
+    _log_message(
+        wa_id, sender_name, text_body,
+        status="HUMAN_UDIT",
+        reply_text=text_body,
+    )
+    if msg_id:
+        _seen_ids.add(msg_id)
+        _persist_seen_id(msg_id)
+    print(f"[HUMAN_UDIT] Logged manual reply for {wa_id} (sender={sender_name!r}, {len(text_body)} chars)")
 
 
 def _handle_pause_directive(wa_id: str, text_body: str) -> str | None:
@@ -1091,6 +1286,11 @@ def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
             print(f"[WATI] API rejected the message: {info}")
         elif response.ok:
             print(f"[WATI] Sent reply to {wa_id} ({len(reply_text)} chars)")
+            # Register the outbound so WATI's subsequent outbound webhook
+            # (echoing this same message back) is identified as bot-originated
+            # rather than Udit's manual reply — prevents HUMAN_UDIT mis-tagging
+            # that would otherwise suppress the AUTO flow.
+            _record_bot_outbound(reply_text, data if isinstance(data, dict) else None)
         else:
             print(f"[WATI] HTTP failure {response.status_code}")
     except requests.RequestException as e:
@@ -1515,11 +1715,22 @@ def webhook():
             print("[WEBHOOK] Skipped: missing waId")
             return jsonify({"status": "ok"}), 200
 
-        # #pause / #resume directive scan. Done EARLY so a directive
-        # embedded in Udit's manual outbound (which arrives at /webhook
-        # via WATI's outbound echo) is honoured before any other gate
-        # could discard the event. The directive itself doesn't get
-        # replied to; we mark seen-id so re-fires don't reprocess.
+        # OUTBOUND BRANCH — when WATI delivers an outbound event to this
+        # same endpoint (some plans do; others use a separate URL — see
+        # /wati-outbound below), divert to the dedicated handler. This
+        # path is responsible for distinguishing the bot's own send from
+        # Udit's manual reply and tagging accordingly (HUMAN_UDIT or
+        # PAUSE_DIRECTIVE). The existing inbound dedup + pause-directive
+        # scan keeps applying to inbound events.
+        if _is_outbound_event(data):
+            print(f"[WEBHOOK] Outbound event detected (wa_id={wa_id!r})")
+            _process_wati_outbound(data)
+            return jsonify({"status": "ok"}), 200
+
+        # Inbound from this point on. The existing #pause / #resume
+        # directive scan still applies in case a customer types one
+        # (rare, and the false-positive cost is just self-pausing
+        # themselves for 4h — see _handle_pause_directive doc).
         directive = _handle_pause_directive(wa_id, text_body)
         if directive is not None:
             if msg_id:
@@ -1560,6 +1771,15 @@ def webhook():
             print(f"[PAUSED] Skipping reply — human takeover active for {wa_id}")
             _log_message(wa_id, sender_name, text_body, status="PAUSED")
             return jsonify({"status": "ok"}), 200
+
+        # SAFETY NET — if Udit replied manually in the last 4 hours
+        # (HUMAN_UDIT row in DB), suppress the auto-reply. Catches the
+        # case where he forgot to type #pause but did respond from WATI.
+        # This is the fallback for brain.md Section 7 + Guardrail 41.
+        if _udit_replied_recently(wa_id):
+            print(f"[HUMAN_HANDLING] Udit replied recently — skipping auto-reply for {wa_id}")
+            _log_message(wa_id, sender_name, text_body, status="HUMAN_HANDLING")
+            return jsonify({"status": "human_handling"}), 200
 
         print(f"[WEBHOOK] Processing text from {sender_name or wa_id}: {text_body[:200]}")
 
@@ -1645,6 +1865,34 @@ def webhook():
         except Exception:
             pass
         print("=" * 60 + "\n")
+        return jsonify({"status": "ok"}), 200
+
+
+@app.route("/wati-outbound", methods=["POST"])
+def wati_outbound():
+    """Dedicated outbound-message webhook for WATI plans that allow
+    configuring inbound and outbound URLs separately.
+
+    Treats EVERY event arriving here as outbound, regardless of payload
+    shape. Use this URL in WATI Dashboard → Webhooks → Outgoing Message
+    Webhook URL if your WATI plan exposes that setting. If your plan
+    uses a single webhook URL for both directions, leave WATI pointed
+    at /webhook (which auto-detects outbound via the same logic) and
+    ignore this endpoint.
+
+    Always returns 200 so WATI doesn't retry on internal errors.
+    """
+    print("\n" + "=" * 60)
+    try:
+        data = request.get_json(silent=True) or {}
+        # Diagnostic — log the keys of the first few events so we can
+        # see what WATI actually sends if detection misbehaves.
+        print(f"[OUTBOUND] payload keys: {sorted(data.keys())[:20]}")
+        _process_wati_outbound(data)
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        print(f"[OUTBOUND] EXCEPTION: {type(e).__name__}: {e}")
+        traceback.print_exc()
         return jsonify({"status": "ok"}), 200
 
 
