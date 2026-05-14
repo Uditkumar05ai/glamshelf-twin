@@ -67,13 +67,13 @@ BRAIN_FILE = PROJECT_DIR / "brain" / "brain.md"
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 2048
 
-# Telegram notification config. Override on Render via env vars.
-# SECURITY NOTE: The defaults below are committed to source — fine for a
-# private internal tool but rotate the bot token if the repo ever goes public.
-TELEGRAM_BOT_TOKEN = os.environ.get(
-    "TELEGRAM_BOT_TOKEN", "***REVOKED-TELEGRAM-TOKEN***"
-)
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6733243879")
+# Telegram notification config. Set both on Render → Environment.
+# No default for TELEGRAM_BOT_TOKEN — a previous default value was the live
+# token, which GitGuardian flagged. Now empty → if the env var isn't set on
+# Render, send_telegram_notification() short-circuits with a "Skipped" log
+# instead of authenticating with a secret committed to source.
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TELEGRAM_TIMEOUT_SECONDS = 5
 
 # WATI (WhatsApp Business API) config. Set these in Render env vars.
