@@ -353,7 +353,7 @@ _sent_shipping_updates: set[tuple[str, str]] = set()
 # REVIEW_DELAY_SECONDS is a module-level constant so tests can monkey-
 # patch it (e.g. set to 60 for a 1-minute verification end-to-end)
 # without touching the scheduling logic.
-REVIEW_DELAY_SECONDS = 10 * 24 * 60 * 60   # 864000s = 10 days
+REVIEW_DELAY_SECONDS = 60   # TESTING — 1 minute. REVERT to 10 * 24 * 60 * 60 before merging to master.
 _scheduled_reviews: dict[str, dict] = {}
 
 REVIEW_REQUEST_TEMPLATE = (
