@@ -68,6 +68,49 @@ BRAIN_FILE = PROJECT_DIR / "brain" / "brain.md"
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 2048
 
+# ----- Vision (image understanding) config -----
+#
+# When a WATI inbound event has type=image, the handler downloads the
+# image, sends it to Claude's vision API for order-info extraction, and
+# then either (a) synthesizes a text query and runs the normal Claude
+# reply pipeline, or (b) on low confidence / failure, sends the
+# deterministic fallback reply asking the customer to type their order ID.
+#
+# Uses the same MODEL constant as text replies — claude-sonnet-4-6 has
+# vision capability built in; no separate vision-only model needed.
+VISION_MAX_TOKENS = 512                # extraction output is short JSON
+VISION_DOWNLOAD_TIMEOUT_SECONDS = 10   # per spec — give up fast on slow WATI media
+
+VISION_SYSTEM_PROMPT = """You are extracting order information from a customer screenshot for The Glam Shelf, an Indian eyelash brand.
+
+Extract any of the following if visible:
+- Order ID / Order number (format: #XXXX or plain number)
+- Payment status
+- Amount paid
+- Product name
+- Customer name
+- Date of order
+
+Respond ONLY in this JSON format:
+{
+  "order_id": "1042" or null,
+  "payment_status": "paid" or null,
+  "amount": "849" or null,
+  "product": "GS1 Luxe Light Lash Tray" or null,
+  "customer_name": "Priya" or null,
+  "confidence": "high" or "low"
+}
+
+If you cannot extract anything useful, return all nulls with confidence "low"."""
+
+# Deterministic reply used when vision can't make sense of the screenshot
+# (low confidence, download failure, or no image URL in payload). Mirrors
+# the brain's pre-vision IMAGE RECEIVED template so the tone is consistent.
+FALLBACK_VISION_REPLY = (
+    "Thanks for sharing! I couldn't quite make out the screenshot — could you "
+    "type out the order ID from it? It usually starts with a # 🤍"
+)
+
 # Telegram notification config. Set both on Render → Environment.
 # No default for TELEGRAM_BOT_TOKEN — a previous default value was the live
 # token, which GitGuardian flagged. Now empty → if the env var isn't set on
@@ -1986,6 +2029,154 @@ def strip_markdown_fences(text: str) -> tuple[str, bool]:
     return cleaned.strip(), was_fenced
 
 
+def _extract_wati_image_url(data: dict) -> str:
+    """Try the known WATI payload locations for a media image URL.
+
+    The existing webhook handler historically dropped non-text events
+    without ever inspecting the image-shaped payload, so we have no
+    on-record knowledge of WATI's exact field layout for images. This
+    function probes the common WATI patterns from the past few plan
+    versions and returns the first HTTP(S) URL it finds:
+
+      data.data            (sometimes the URL is dumped here as a string)
+      data.mediaUrl
+      data.image           (string form)
+      data.media.url / .link / .uri
+      data.image.url / .link / .uri
+      data.data.url / .link / .uri
+
+    Returns "" if no URL was found — caller falls back to the
+    deterministic "please type your order ID" reply. The full top-level
+    keys are logged once per call so the first real image event reveals
+    the actual layout if extraction misses.
+    """
+    found: list[str] = []
+
+    def _push(v: object) -> None:
+        if isinstance(v, str) and v.startswith(("http://", "https://")):
+            found.append(v)
+
+    # Direct fields — sometimes the URL is the value, not nested.
+    _push(data.get("data"))
+    _push(data.get("mediaUrl"))
+    _push(data.get("image"))
+
+    # Nested objects under common keys.
+    for key in ("media", "image", "data"):
+        sub = data.get(key)
+        if isinstance(sub, dict):
+            for inner in ("url", "link", "uri"):
+                _push(sub.get(inner))
+
+    return found[0] if found else ""
+
+
+def _extract_image_info(image_url: str) -> dict | None:
+    """Download a WATI media image and extract order info via Claude Vision.
+
+    Returns the parsed extraction dict on success (with possibly null
+    fields and a "confidence" marker), or None on any failure — download
+    timeout, HTTP error, vision API error, JSON parse failure, anything.
+    NEVER raises.
+
+    The vision call is intentionally SEPARATE from the main reply pipeline
+    (ask_claude). This keeps the system prompts cleanly scoped: vision's
+    job is ONLY structured extraction, not voice / classification. The
+    extracted info is then handed to the main pipeline as a synthesized
+    text query, so the brain's reply rules still drive the response.
+    """
+    if not image_url:
+        return None
+
+    # ----- Step 1: download the image bytes -----
+    # WATI's media URLs sometimes require the same Bearer token used for
+    # sendSessionMessage; sometimes they're plain CDN URLs that 401 when
+    # auth headers are present. We try with auth first, fall back to no
+    # auth if that returns 401/403.
+    headers_with_auth = {}
+    if WATI_API_KEY:
+        headers_with_auth["Authorization"] = f"Bearer {WATI_API_KEY}"
+
+    image_bytes: bytes | None = None
+    content_type: str = "image/jpeg"
+    try:
+        resp = requests.get(
+            image_url, headers=headers_with_auth, timeout=VISION_DOWNLOAD_TIMEOUT_SECONDS
+        )
+        if resp.status_code in (401, 403) and headers_with_auth:
+            # Retry without auth — some WATI plans hand back signed CDN URLs.
+            resp = requests.get(
+                image_url, timeout=VISION_DOWNLOAD_TIMEOUT_SECONDS
+            )
+        if not resp.ok:
+            print(f"[VISION] Download HTTP {resp.status_code} for {image_url[:120]}")
+            return None
+        image_bytes = resp.content
+        raw_ct = resp.headers.get("Content-Type", "image/jpeg")
+        # Strip "; charset=..." parameters and validate the prefix.
+        candidate_ct = raw_ct.split(";")[0].strip().lower()
+        if candidate_ct.startswith("image/") and candidate_ct in (
+            "image/jpeg", "image/png", "image/gif", "image/webp"
+        ):
+            content_type = candidate_ct
+        else:
+            # Default to jpeg if Content-Type is missing or non-standard;
+            # Claude's vision API accepts the four formats above.
+            content_type = "image/jpeg"
+    except requests.RequestException as e:
+        print(f"[VISION] Download network error: {type(e).__name__}: {e}")
+        return None
+    except Exception as e:
+        print(f"[VISION] Download unexpected error: {type(e).__name__}: {e}")
+        return None
+
+    if not image_bytes:
+        print("[VISION] Download returned empty body")
+        return None
+
+    print(f"[VISION] Downloaded image ({len(image_bytes)} bytes, type={content_type})")
+
+    # ----- Step 2: send to Claude Vision for extraction -----
+    raw = ""  # so it's defined for the except branch below
+    try:
+        b64 = base64.standard_b64encode(image_bytes).decode("ascii")
+        message = client.messages.create(
+            model=MODEL,
+            max_tokens=VISION_MAX_TOKENS,
+            system=VISION_SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": content_type,
+                            "data": b64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": "Extract any order information visible in this screenshot per the system prompt. Return ONLY raw JSON.",
+                    },
+                ],
+            }],
+        )
+        raw = "".join(b.text for b in message.content if b.type == "text").strip()
+        cleaned, _ = strip_markdown_fences(raw)
+        parsed = json.loads(cleaned)
+        if not isinstance(parsed, dict):
+            print(f"[VISION] Parsed JSON was not a dict: {type(parsed).__name__}")
+            return None
+        return parsed
+    except json.JSONDecodeError as e:
+        print(f"[VISION] JSON parse error: {e}; raw={raw[:200]!r}")
+        return None
+    except Exception as e:
+        print(f"[VISION] Claude Vision error: {type(e).__name__}: {e}")
+        return None
+
+
 def ask_claude(
     brain: str,
     customer_message: str,
@@ -2262,12 +2453,19 @@ def webhook():
             f"sender={sender_name!r} msg_id={msg_id!r}"
         )
 
-        # Skip non-text events (images, audio, video, documents, stickers, status updates).
-        if message_type != "text":
-            print(f"[WEBHOOK] Skipped: non-text message type {message_type!r}")
+        # Allow text + image past the front gate. Everything else (audio,
+        # video, documents, stickers, status updates) is silently dropped.
+        # Image events get downloaded + sent to Claude Vision further down
+        # AFTER the safety nets (dedup, pause, HUMAN_UDIT) — we don't want
+        # to burn a Vision API call on a duplicate webhook delivery or
+        # while a human takeover is active.
+        if message_type not in ("text", "image"):
+            print(f"[WEBHOOK] Skipped: unsupported message type {message_type!r}")
             return jsonify({"status": "ok"}), 200
 
-        if not text_body:
+        # text_body emptiness only matters for text events — image events
+        # may legitimately have no caption.
+        if message_type == "text" and not text_body:
             print("[WEBHOOK] Skipped: empty text body")
             return jsonify({"status": "ok"}), 200
 
@@ -2338,8 +2536,78 @@ def webhook():
         # This is the fallback for brain.md Section 7 + Guardrail 41.
         if _udit_replied_recently(wa_id):
             print(f"[HUMAN_HANDLING] Udit replied recently — skipping auto-reply for {wa_id}")
-            _log_message(wa_id, sender_name, text_body, status="HUMAN_HANDLING")
+            _log_message(wa_id, sender_name, text_body or "[image]", status="HUMAN_HANDLING")
             return jsonify({"status": "human_handling"}), 200
+
+        # ----- VISION BRANCH -----
+        # For image events: download + extract via Claude Vision. Three outcomes:
+        #   (a) high confidence + order_id found → synthesize a text query
+        #       (e.g. "My order ID is #1042") and fall through to the
+        #       normal text Claude pipeline below
+        #   (b) high confidence but no order_id → synthesize a context-rich
+        #       message ("I sent a screenshot — product: GS1, amount ₹849…")
+        #       and fall through to the normal pipeline
+        #   (c) low confidence / failure / no URL → send the deterministic
+        #       FALLBACK_VISION_REPLY directly via WATI and return
+        if message_type == "image":
+            # Diagnostic on every image event — lets the founder grep Render
+            # logs to see what WATI's payload actually contains. Useful while
+            # the URL extraction is still calibrated against unknown plan
+            # variations.
+            print(f"[VISION] Image event payload keys: {sorted(data.keys())[:30]}")
+
+            image_url = _extract_wati_image_url(data)
+            extracted: dict | None = None
+            if image_url:
+                print(f"[VISION] Image URL resolved: {image_url[:120]}")
+                try:
+                    extracted = _extract_image_info(image_url)
+                except Exception as e:
+                    print(f"[VISION] Unexpected error during extraction: {type(e).__name__}: {e}")
+                    extracted = None
+            else:
+                print("[VISION] No image URL found in payload — will fall back")
+
+            confidence = (extracted or {}).get("confidence", "").lower() if extracted else ""
+            order_id = (extracted or {}).get("order_id") if extracted else None
+
+            if extracted and confidence == "high" and order_id:
+                # Path (a): synthesize text and fall through.
+                synth_parts = [f"My order ID is #{order_id}"]
+                amt = extracted.get("amount")
+                if amt:
+                    synth_parts.append(f"(₹{amt})")
+                name = extracted.get("customer_name")
+                if name:
+                    synth_parts.append(f"— name: {name}")
+                text_body = " ".join(synth_parts)
+                print(f"[VISION] Extracted order_id={order_id} confidence=high — synthesized text: {text_body!r}")
+            elif extracted and confidence == "high":
+                # Path (b): no order_id but extraction confident on other fields.
+                parts = []
+                if extracted.get("customer_name"):
+                    parts.append(f"name: {extracted['customer_name']}")
+                if extracted.get("product"):
+                    parts.append(f"product: {extracted['product']}")
+                if extracted.get("amount"):
+                    parts.append(f"amount: ₹{extracted['amount']}")
+                if extracted.get("payment_status"):
+                    parts.append(f"payment: {extracted['payment_status']}")
+                detail = "; ".join(parts) if parts else "no specific details visible"
+                text_body = f"I just sent a screenshot of my order — {detail}. Can you help me with this?"
+                print(f"[VISION] Extracted info confidence=high but no order_id — synthesized context")
+            else:
+                # Path (c): low confidence, no extraction, or no URL.
+                print(f"[VISION] Low confidence or no order_id (confidence={confidence!r}) — falling back to text flow")
+                send_whatsapp_reply(wa_id, FALLBACK_VISION_REPLY)
+                elapsed_ms = int((time.time() - t_start) * 1000)
+                _log_message(
+                    wa_id, sender_name, "[image]",
+                    status="AUTO", reply_text=FALLBACK_VISION_REPLY,
+                    latency_ms=elapsed_ms,
+                )
+                print("=" * 60 + "\n")
+                return jsonify({"status": "ok"}), 200
 
         print(f"[WEBHOOK] Processing text from {sender_name or wa_id}: {text_body[:200]}")
 
