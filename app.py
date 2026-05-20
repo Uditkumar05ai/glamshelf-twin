@@ -1540,7 +1540,15 @@ def _handle_telegram_callback(cb: dict) -> None:
     draft_id = parsed.get("id")
     customer_number = parsed.get("num")
 
-    draft = _pending_drafts.get(draft_id) if draft_id else None
+    # Atomic pop — dict.pop is thread-safe in CPython, so two rapid taps
+    # racing into this function only one of them gets the draft; the other
+    # gets None and falls through to the "already handled" dedup branch.
+    # Without this, a fast double-tap on "Send as-is" could pass the
+    # "if not draft" check twice and double-send to the customer.
+    #
+    # The edit branch below re-inserts the draft (with awaiting_edit=True)
+    # because the follow-up text message handler needs to find it.
+    draft = _pending_drafts.pop(draft_id, None) if draft_id else None
 
     # Dedup — second tap on same button (or post-restart orphan).
     if not draft:
@@ -1563,14 +1571,16 @@ def _handle_telegram_callback(cb: dict) -> None:
             chat_id, message_id, original_text,
             f"✅ Sent to {name_for_display}",
         )
-        del _pending_drafts[draft_id]
+        # Already popped at top — no del needed.
         print(f"[TELEGRAM DRAFT] Send-as-is for {customer_number} (draft {draft_id})")
 
     elif action == "edit":
-        # Flip the awaiting flag; the next message from this chat becomes
-        # the edited reply (see _handle_telegram_message).
+        # Re-insert the draft so the next text message from this chat can
+        # find it via _handle_telegram_message. Flip awaiting_edit so the
+        # message handler routes to the edit flow.
         draft["awaiting_edit"] = True
         draft["edit_started_at"] = time.time()
+        _pending_drafts[draft_id] = draft
         _telegram_api("answerCallbackQuery", {
             "callback_query_id": callback_id, "text": "Send your edit"
         })
@@ -1598,14 +1608,18 @@ def _handle_telegram_callback(cb: dict) -> None:
             chat_id, message_id, original_text,
             "⛔ Skipped — handle manually in WATI",
         )
-        del _pending_drafts[draft_id]
+        # Already popped at top — no del needed.
         print(f"[TELEGRAM DRAFT] Skipped for {customer_number} (draft {draft_id})")
 
     else:
+        # Malformed callback_data (unknown action verb). The atomic pop
+        # already removed the draft; we don't re-insert because we don't
+        # know how to recover. The draft is effectively skipped, which is
+        # the safer failure mode than re-inserting in an unknown state.
         _telegram_api("answerCallbackQuery", {
             "callback_query_id": callback_id, "text": "Unknown action"
         })
-        print(f"[TELEGRAM DRAFT] Unknown action {action!r} on draft {draft_id}")
+        print(f"[TELEGRAM DRAFT] Unknown action {action!r} on draft {draft_id} — draft dropped")
 
 
 def _handle_telegram_message(msg: dict) -> None:
@@ -2528,19 +2542,30 @@ def review_debug():
 
     now = time.time()
     items = []
-    for order_id, entry in _scheduled_reviews.items():
-        scheduled_at = entry.get("scheduled_at") or 0
-        fires_at = scheduled_at + REVIEW_DELAY_SECONDS
-        remaining_seconds = max(0.0, fires_at - now)
-        items.append({
-            "order_id": order_id,
-            "order_number": entry.get("order_number") or "",
-            "customer_number": entry.get("customer_number") or "",
-            "customer_name": entry.get("customer_name") or "",
-            "scheduled_at": scheduled_at,
-            "fires_in_hours": round(remaining_seconds / 3600, 2),
-        })
-    items.sort(key=lambda x: x["fires_in_hours"])
+    # Iterate over a snapshot copy — _scheduled_reviews can be mutated
+    # concurrently by a daemon timer thread (_send_review_request pops
+    # entries on fire). Iterating the live dict would raise
+    # RuntimeError: dictionary changed size during iteration. The
+    # try/except is a belt-and-suspenders fallback in case the copy()
+    # itself races.
+    try:
+        reviews_copy = dict(_scheduled_reviews)
+        for order_id, entry in reviews_copy.items():
+            scheduled_at = entry.get("scheduled_at") or 0
+            fires_at = scheduled_at + REVIEW_DELAY_SECONDS
+            remaining_seconds = max(0.0, fires_at - now)
+            items.append({
+                "order_id": order_id,
+                "order_number": entry.get("order_number") or "",
+                "customer_number": entry.get("customer_number") or "",
+                "customer_name": entry.get("customer_name") or "",
+                "scheduled_at": scheduled_at,
+                "fires_in_hours": round(remaining_seconds / 3600, 2),
+            })
+        items.sort(key=lambda x: x["fires_in_hours"])
+    except Exception as e:
+        print(f"[REVIEW-DEBUG] Error reading _scheduled_reviews: {type(e).__name__}: {e}")
+        return jsonify({"error": "internal", "detail": f"{type(e).__name__}: {e}"}), 500
 
     return jsonify({
         "scheduled_reviews": items,
@@ -3606,21 +3631,6 @@ def _process_instagram_event(event: dict) -> None:
         _log_instagram(sender_id, text, reply, timestamp)
         print(f"[INSTAGRAM] Logged DM exchange for {sender_id} ({classification})")
 
-        # ===== TEMP DEBUG — remove once IG Telegram path is confirmed working =====
-        # Logs the exact classification value (repr exposes whitespace / casing /
-        # unicode quirks the regular log line would hide) AND whether the
-        # membership test the dispatch branch depends on will return True.
-        # Two prints because we need to distinguish three failure modes:
-        #   - membership test returns False (then no entered-branch line)
-        #   - branch entered but send_telegram_notification silent (no [TG] line)
-        #   - branch entered AND function called (a [TG] line appears below)
-        should_notify = classification in ("DRAFT+APPROVE", "ESCALATE")
-        print(
-            f"[INSTAGRAM-DEBUG] before-dispatch: "
-            f"classification={classification!r} should_notify={should_notify}"
-        )
-        # ===== END TEMP DEBUG =====
-
         # Page the founder on Telegram for non-AUTO classifications,
         # mirroring the WATI webhook. AUTO sends nothing (the bot's
         # reply is safe to ship as-is and doesn't warrant a ping). The
@@ -3629,7 +3639,6 @@ def _process_instagram_event(event: dict) -> None:
         # Wrapped in its own try so a Telegram outage doesn't take down
         # the IG flow.
         if classification in ("DRAFT+APPROVE", "ESCALATE"):
-            print(f"[INSTAGRAM-DEBUG] entered dispatch branch for {classification!r}")
             try:
                 ig_sender_info = f"Instagram DM — sender {sender_id}"
                 send_telegram_notification(
